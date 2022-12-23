@@ -19,15 +19,13 @@ python3 qu1cksc0pe.py --file suspicious_file --analyze
 ```
 
 # Screenshot
-![Screenshot](https://user-images.githubusercontent.com/42123683/189416059-339b4a6c-57e0-4c8c-a2a3-380161f89d55.png)
+![2022-12-07_12-37](https://user-images.githubusercontent.com/42123683/206153096-859f2102-f8ec-44fb-bd97-5f135478c098.png)
 
 # Updates
-<b>14/09/2022</b>
-- [X] Bug fixes on ```DocumentAnalyzer``` module. PDF analyzer now have better embedded URL detection capabilities.
+<b>15/12/2022</b>
+- [X] Improvements on ```Emulator``` module for android application analysis.<br>
 
-<b>12/09/2022</b>
-- [X] ```DocumentAnalyzer``` module is upgraded. Now Qu1cksc0pe can extract embedded files/exploits from PDF files!!<br>
-![exploit](https://user-images.githubusercontent.com/42123683/189676266-d2b6f502-b254-4de1-ad6e-bbc03740febc.gif)
+https://user-images.githubusercontent.com/42123683/206153248-801eef87-b383-4ee2-8977-0a48c2e3b738.mp4
 
 # Available On
 ![blackarch](https://user-images.githubusercontent.com/42123683/189416163-4ffd12ce-dd62-4510-b496-924396ce77c2.png)
