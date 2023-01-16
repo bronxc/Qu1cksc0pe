@@ -35,7 +35,7 @@ python3 qu1cksc0pe.py --file suspicious_file --analyze
 <b>16/01/2023</b>
 - [X] Added JAR file analysis. Now Qu1cksc0pe can perform source code analysis on JAR files.<br>
 
-https://user-images.githubusercontent.com/42123683/206153248-801eef87-b383-4ee2-8977-0a48c2e3b738.mp4
+https://user-images.githubusercontent.com/42123683/212719742-5c6a725d-d6c0-45c1-821b-3295b1ad2c14.mp4
 
 # Available On
 ![blackarch](https://user-images.githubusercontent.com/42123683/189416163-4ffd12ce-dd62-4510-b496-924396ce77c2.png)
