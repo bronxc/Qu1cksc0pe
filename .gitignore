@@ -67,6 +67,19 @@ instance/
 webui_uploads/
 sc0pe_reports/
 
+# Qu1cksc0pe runtime artifacts written to the repo root by direct CLI use
+# (Web UI / MCP server archive their copies into sc0pe_reports/ instead,
+# already covered above; these are the loose files a plain
+# `python qu1cksc0pe.py --file ... --report` run leaves behind)
+sc0pe_*_report.json
+sc0pe_process-*.json
+qu1cksc0pe_memory_dump_*.bin
+temp.txt
+.target-file.txt
+.target-folder.txt
+TargetAPK/
+TargetSource/
+
 # Scrapy stuff:
 .scrapy
 

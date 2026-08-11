@@ -113,9 +113,36 @@ def execute_module(target, path=MODULE_PREFIX, invoker=py_binary):
     parts  = target.split(" ", 1)
     script = parts[0]
     extra  = f" {parts[1]}" if len(parts) > 1 else ""
-    os.system(f'{invoker} "{path}{script}"{extra}')
+    # cmd.exe's `/c` only preserves quoting cleanly when the command string
+    # contains exactly two quote characters; with more (invoker path quoted
+    # *and* script path quoted, as below) it falls back to stripping just the
+    # first and last quote, mangling everything in between. Wrapping the
+    # whole command in one more outer quote pair is the standard workaround.
+    inner_command = f'"{invoker}" "{path}{script}"{extra}'
+    os.system(f'"{inner_command}"')
 
-import Modules.banners # show a banner
+# Only the *stdio* MCP transport talks JSON-RPC over this process's own
+# stdout, so only that mode requires suppressing the startup banner. Other
+# transports (streamable-http, the default; sse) bind a port instead and
+# never touch stdout as a protocol channel, so the banner is safe there.
+# Mirrors Modules/mcp_server.py's own SC0PE_MCP_TRANSPORT default.
+_mcp_requested = "--mcp" in sys.argv
+_mcp_transport = os.environ.get("SC0PE_MCP_TRANSPORT", "streamable-http").strip().lower()
+if not (_mcp_requested and _mcp_transport == "stdio"):
+    import Modules.banners # show a banner
+del _mcp_requested, _mcp_transport
+
+# API keys manageable via --key_init (interactive menu) or --key_init
+# --key_provider <id> (non-interactive, scriptable). Shared by the
+# smart_analyzer.py cloud AI backends via matching filenames.
+API_KEY_PROVIDERS = {
+    "virustotal": {"label": "VirusTotal", "filename": "sc0pe_VT_apikey.txt"},
+    "claude": {"label": "Claude (Anthropic)", "filename": "sc0pe_claude_apikey.txt"},
+    "openai": {"label": "OpenAI", "filename": "sc0pe_openai_apikey.txt"},
+    "deepseek": {"label": "DeepSeek", "filename": "sc0pe_deepseek_apikey.txt"},
+    "kimi": {"label": "Kimi (Moonshot AI)", "filename": "sc0pe_kimi_apikey.txt"},
+    "glm": {"label": "GLM (Zhipu AI)", "filename": "sc0pe_glm_apikey.txt"},
+}
 
 # Argument crating, parsing and handling
 ARG_NAMES_TO_KWARG_OPTS = {
@@ -128,16 +155,19 @@ ARG_NAMES_TO_KWARG_OPTS = {
     "domain": {"help": "Extract URLs and IP addresses from file.", "action": "store_true"},
     "hashscan": {"help": "Scan target file's hash in local database.", "action": "store_true"},
     "install": {"help": "Install or Uninstall Qu1cksc0pe.", "action": "store_true"},
-    "key_init": {"help": "Enter your VirusTotal API key.", "action": "store_true"},
+    "key_init": {"help": "Manage API keys (VirusTotal + AI providers). Shows an interactive menu; combine with --key_provider to skip it.", "action": "store_true"},
+    "key_provider": {"help": "With --key_init, set this specific provider's key non-interactively (skips the menu).", "choices": list(API_KEY_PROVIDERS.keys()), "default": None},
     "lang": {"help": "Detect programming language.", "action": "store_true"},
     "packer": {"help": "Check if your file is packed with common packers.", "action": "store_true"},
     "resource": {"help": "Analyze resources in target file", "action": "store_true"},
     "report": {"help": "Export analysis reports into a file (JSON Format for now).", "action": "store_true"},
     "ai": {"help": "Analyze generated report using smart analyzer (requires --report; enabled automatically).", "action": "store_true"},
+    "ai_provider": {"help": "AI backend for --ai: auto (Ollama, default, local/private), ollama, claude, openai, deepseek, kimi, or glm.", "choices": ["auto", "ollama", "claude", "openai", "deepseek", "kimi", "glm"], "default": None},
     "watch": {"help": "Perform dynamic analysis against Windows/Android files. (Linux will coming soon!!)", "action": "store_true"},
     "sigcheck": {"help": "Scan file signatures in target file.", "action": "store_true"},
     "vtFile": {"help": "Scan your file with VirusTotal API.", "action": "store_true"},
-    "ui": {"help": "Launch Flask-based web interface.", "action": "store_true"}
+    "ui": {"help": "Launch Flask-based web interface.", "action": "store_true"},
+    "mcp": {"help": "Launch MCP (Model Context Protocol) server for AI assistant integration.", "action": "store_true"}
 }
 
 parser = argparse.ArgumentParser()
@@ -149,6 +179,12 @@ args = parser.parse_args()
 # If user requests AI analysis, we must have a report to analyze.
 if getattr(args, "ai", False) and not getattr(args, "report", False):
     args.report = True
+
+# Explicit --ai_provider overrides whatever SC0PE_AI_PROVIDER may already be
+# set to; leave the environment untouched otherwise so a pre-set env var
+# (e.g. for scripted/CI use) keeps working without passing the flag.
+if getattr(args, "ai_provider", None):
+    os.environ["SC0PE_AI_PROVIDER"] = args.ai_provider
 
 def _latest_report_path():
     try:
@@ -206,6 +242,66 @@ def launch_web_ui():
             f"{errorS} Failed to launch Web UI. Make sure dependencies are installed "
             f"(e.g. [bold green]pip install -r requirements.txt[white]).",
             arg_override=ui_proc.returncode,
+        )
+
+def _save_api_key(prompt_label, filename):
+    # Deliberately no try/except KeyboardInterrupt here: this is called both
+    # standalone (--key_init --key_provider, where main()'s top-level handler
+    # should catch Ctrl+C) and in a loop from _key_init_menu() (where that
+    # loop's own handler should catch it so the menu actually exits instead
+    # of silently swallowing the interrupt and looping back).
+    apikey = str(input(f"{infoC} Enter your {prompt_label} API key: ")).strip()
+    if not apikey:
+        print(f"{errorS} No key entered; {prompt_label} API key was not saved.")
+        return
+
+    if not os.path.exists(f"{homeD}{path_seperator}sc0pe_Base"):
+        os.system(f"mkdir {homeD}{path_seperator}sc0pe_Base")
+
+    apifile = open(f"{homeD}{path_seperator}sc0pe_Base{path_seperator}{filename}", "w")
+    apifile.write(apikey)
+    print(f"{foundS} Your {prompt_label} API key saved.")
+
+def _key_init_menu():
+    items = list(API_KEY_PROVIDERS.items())
+    try:
+        while True:
+            print("\n[bold cyan]>>> Qu1cksc0pe API Key Manager[white]")
+            for idx, (_provider_id, meta) in enumerate(items, start=1):
+                print(f"  [bold green]{idx}[white]) {meta['label']}")
+            print("  [bold green]0[white]) Exit")
+            choice = str(input(f"\n{infoC} Select an option: ")).strip()
+            if choice in ("", "0"):
+                break
+            try:
+                idx = int(choice)
+                if idx < 1 or idx > len(items):
+                    raise ValueError
+                selected = items[idx - 1]
+            except ValueError:
+                print(f"{errorS} Invalid selection.")
+                continue
+            _provider_id, meta = selected
+            _save_api_key(meta["label"], meta["filename"])
+    except KeyboardInterrupt:
+        print("\n[bold white on red]Program terminated by user.\n")
+
+def launch_mcp_server():
+    mcp_server_path = os.path.join(sc0pe_path, "Modules", "mcp_server.py")
+    if not os.path.exists(mcp_server_path):
+        err_exit(f"{errorS} MCP server entrypoint not found: {mcp_server_path}")
+    # Once launched, the child owns stdout/stdin as the MCP JSON-RPC channel,
+    # so nothing may be written to stdout from here on -- log to stderr instead.
+    print(f"{infoS} Launching [bold green]Qu1cksc0pe MCP Server[white]...", file=sys.stderr)
+    try:
+        mcp_proc = subprocess.run([sys.executable, mcp_server_path], check=False)
+    except KeyboardInterrupt:
+        return
+    if mcp_proc.returncode != 0:
+        err_exit(
+            f"{errorS} Failed to launch MCP server. Make sure dependencies are installed "
+            f"(e.g. [bold green]pip install -r requirements.txt[white]).",
+            arg_override=mcp_proc.returncode,
         )
 
 # Basic analyzer function that handles single and multiple scans
@@ -358,6 +454,11 @@ def Qu1cksc0pe():
     # Launch Flask web UI and exit.
     if args.ui:
         launch_web_ui()
+        return
+
+    # Launch MCP server and exit.
+    if args.mcp:
+        launch_mcp_server()
         return
 
 
@@ -525,20 +626,13 @@ def Qu1cksc0pe():
     if args.db_update:
         execute_module(f"hashScanner.py --db_update")
 
-    # entering VT API key
+    # Managing VirusTotal / AI provider API keys
     if args.key_init:
-        try:
-            if os.path.exists(f"{homeD}{path_seperator}sc0pe_Base"):
-                pass
-            else:
-                os.system(f"mkdir {homeD}{path_seperator}sc0pe_Base")
-
-            apikey = str(input(f"{infoC} Enter your VirusTotal API key: "))
-            apifile = open(f"{homeD}{path_seperator}sc0pe_Base{path_seperator}sc0pe_VT_apikey.txt", "w")
-            apifile.write(apikey)
-            print(f"{foundS} Your VirusTotal API key saved.")
-        except KeyboardInterrupt:
-            print("\n[bold white on red]Program terminated by user.\n")
+        if args.key_provider:
+            meta = API_KEY_PROVIDERS[args.key_provider]
+            _save_api_key(meta["label"], meta["filename"])
+        else:
+            _key_init_menu()
 
     # Install Qu1cksc0pe on your system!!
     if args.install:

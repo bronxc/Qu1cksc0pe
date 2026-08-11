@@ -331,6 +331,163 @@ def _call_ollama_cli(model, prompt, timeout_s=420):
     return (proc.stdout or "").strip()
 
 
+# --------------------------------------------------------------------------
+# Cloud AI providers (Claude, OpenAI, DeepSeek, Kimi/Moonshot, GLM/Zhipu)
+#
+# Ollama stays the default (SC0PE_AI_PROVIDER=auto, or unset) so nothing
+# changes for existing users and no sample data leaves the machine unless a
+# cloud provider is explicitly selected. Set SC0PE_AI_PROVIDER=<name> (or
+# pass --ai_provider to qu1cksc0pe.py) to opt in. Keys are managed via
+# `qu1cksc0pe.py --key_init` (interactive menu) or the matching env var
+# below, which always takes precedence over a saved key file.
+#
+# All cloud providers except Claude speak the same OpenAI-compatible chat
+# completions shape, so they share one call implementation parameterized by
+# base_url/model; only the request/response shape genuinely differs for
+# Claude (Anthropic Messages API).
+# --------------------------------------------------------------------------
+
+CLOUD_PROVIDERS = ("claude", "openai", "deepseek", "kimi", "glm")
+
+# provider_id -> (env var checked first, qu1cksc0pe-managed key filename)
+_PROVIDER_KEY_SOURCE = {
+    "claude": ("ANTHROPIC_API_KEY", "sc0pe_claude_apikey.txt"),
+    "openai": ("OPENAI_API_KEY", "sc0pe_openai_apikey.txt"),
+    "deepseek": ("DEEPSEEK_API_KEY", "sc0pe_deepseek_apikey.txt"),
+    "kimi": ("MOONSHOT_API_KEY", "sc0pe_kimi_apikey.txt"),
+    "glm": ("ZHIPUAI_API_KEY", "sc0pe_glm_apikey.txt"),
+}
+
+# provider_id -> (default chat-completions URL, default model). Both are
+# overridable per-provider via SC0PE_AI_<PROVIDER>_BASE_URL / _MODEL --
+# cloud model names/endpoints drift, don't treat these as permanent.
+_OPENAI_COMPAT_CONFIG = {
+    "openai": ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+    "deepseek": ("https://api.deepseek.com/chat/completions", "deepseek-chat"),
+    "kimi": ("https://api.moonshot.ai/v1/chat/completions", "moonshot-v1-8k"),
+    "glm": ("https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4-flash"),
+}
+
+
+def _resolve_ai_provider():
+    raw = os.environ.get("SC0PE_AI_PROVIDER", "auto").strip().lower()
+    aliases = {"anthropic": "claude", "codex": "openai", "gpt": "openai", "moonshot": "kimi", "zhipu": "glm", "zhipuai": "glm"}
+    raw = aliases.get(raw, raw)
+    if raw in CLOUD_PROVIDERS or raw == "ollama":
+        return raw
+    return "auto"
+
+
+def _read_key_file(filename):
+    try:
+        home = os.path.expanduser("~")
+        path_sep = "\\" if sys.platform == "win32" else "/"
+        key_path = f"{home}{path_sep}sc0pe_Base{path_sep}{filename}"
+        with open(key_path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()[0].strip()
+    except Exception:
+        return ""
+
+
+def _cloud_api_key(provider_id):
+    env_name, key_filename = _PROVIDER_KEY_SOURCE.get(provider_id, ("", ""))
+    if env_name and os.environ.get(env_name, "").strip():
+        return os.environ[env_name].strip()
+    return _read_key_file(key_filename) if key_filename else ""
+
+
+def _no_key_error(provider_id):
+    env_name, _ = _PROVIDER_KEY_SOURCE.get(provider_id, ("", ""))
+    return RuntimeError(
+        f"No {provider_id} API key found. Set {env_name} or run: "
+        f"qu1cksc0pe.py --key_init --key_provider {provider_id}"
+    )
+
+
+def _call_claude_api(prompt, timeout_s=120, max_tokens=None):
+    if requests is None:
+        raise RuntimeError("requests module not available")
+    api_key = _cloud_api_key("claude")
+    if not api_key:
+        raise _no_key_error("claude")
+    model = os.environ.get("SC0PE_AI_CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
+    if max_tokens is None:
+        max_tokens = _env_int("SC0PE_AI_CLAUDE_MAX_TOKENS", 1200, min_value=128, max_value=8192)
+    connect_timeout = min(10, max(2, timeout_s // 8))
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=(connect_timeout, timeout_s),
+    )
+    if resp.status_code >= 400:
+        try:
+            err = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            err = resp.text
+        raise RuntimeError(f"Claude API error {resp.status_code}: {str(err).strip()[:300]}")
+    data = resp.json()
+    parts = data.get("content") or []
+    text = "".join(
+        str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("type") == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError("empty response from Claude API")
+    return text, model
+
+
+def _call_openai_compatible_api(provider_id, prompt, timeout_s=120, max_tokens=None):
+    if requests is None:
+        raise RuntimeError("requests module not available")
+    api_key = _cloud_api_key(provider_id)
+    if not api_key:
+        raise _no_key_error(provider_id)
+
+    default_url, default_model = _OPENAI_COMPAT_CONFIG[provider_id]
+    env_prefix = f"SC0PE_AI_{provider_id.upper()}"
+    url = os.environ.get(f"{env_prefix}_BASE_URL", default_url).strip()
+    model = os.environ.get(f"{env_prefix}_MODEL", default_model).strip()
+    if max_tokens is None:
+        max_tokens = _env_int(f"{env_prefix}_MAX_TOKENS", 1200, min_value=128, max_value=8192)
+    connect_timeout = min(10, max(2, timeout_s // 8))
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "content-type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=(connect_timeout, timeout_s),
+    )
+    if resp.status_code >= 400:
+        try:
+            err = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            err = resp.text
+        raise RuntimeError(f"{provider_id} API error {resp.status_code}: {str(err).strip()[:300]}")
+    data = resp.json()
+    choices = data.get("choices") or []
+    text = ""
+    if choices:
+        text = str(((choices[0] or {}).get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise RuntimeError(f"empty response from {provider_id} API")
+    return text, model
+
+
 def _safe_get(d, path, default=None):
     cur = d
     for key in path:
@@ -911,7 +1068,7 @@ def _heuristic_fallback(summary):
     interesting = summary.get("interesting_findings", [])
 
     lines = []
-    lines.append(f"Overall Assessment: Heuristic analysis (no Ollama response). Type={at}.")
+    lines.append(f"Overall Assessment: Heuristic analysis (no AI response). Type={at}.")
     if risky:
         lines.append(f"- Risky permissions detected: {len(risky)}")
     if cats:
@@ -1605,139 +1762,188 @@ def main():
     cli_timeout_s = _env_int("SC0PE_AI_OLLAMA_CLI_TIMEOUT", 90, min_value=10, max_value=7200)
     total_budget_s = _env_int("SC0PE_AI_TOTAL_BUDGET", 120, min_value=15, max_value=7200)
 
-    # Warn user early if Ollama is not available.
-    has_ollama_http = _probe_ollama_http()
-    has_ollama_cli = bool(shutil.which("ollama"))
-    status_msg = ""
-    if not has_ollama_http and not has_ollama_cli:
-        print("[bold cyan][[bold red]![bold cyan]][white] Ollama not found or not reachable. Falling back to heuristic analysis.")
-        print("[bold cyan][[bold red]*[bold cyan]][white] Install Ollama or set OLLAMA_HOST (default: http://127.0.0.1:11434).")
-        status_msg = "[bold magenta][[bold yellow]*[bold magenta]][bold white] HEURISTIC ANALYSIS IN PROGRESS, PLEASE WAIT..."
-    else:
-        status_msg = "[bold magenta][[bold yellow]*[bold magenta]][bold white] AI QUERY IN PROGRESS, PLEASE WAIT..."
+    # Resolve provider ("auto"/"ollama" preserves the exact pre-existing
+    # Ollama-first, heuristic-fallback behavior below; any of CLOUD_PROVIDERS
+    # is opt-in via SC0PE_AI_PROVIDER or --ai_provider).
+    provider = _resolve_ai_provider()
 
-    if RICH_CONSOLE is None:
-        print(status_msg)
-    status_ctx = RICH_CONSOLE.status(status_msg, spinner="bouncingBar", spinner_style="bold magenta") if RICH_CONSOLE is not None else nullcontext()
-    with status_ctx:
-        # Prefer configured model, but optionally fall back to available local models.
-        model_candidates = [model]
-        err_log = []
-        allow_model_fallback = _env_bool("SC0PE_AI_ALLOW_MODEL_FALLBACK", True)
-        skip_cloud_cli = _env_bool("SC0PE_AI_SKIP_CLOUD_CLI", True)
-        max_model_candidates = _env_int("SC0PE_AI_MAX_MODEL_CANDIDATES", 4, min_value=1, max_value=20)
-        if allow_model_fallback and (has_ollama_http or has_ollama_cli):
-            discovered = []
-            if has_ollama_http and requests is not None:
-                try:
-                    discovered.extend(_list_ollama_models_http(timeout_s=min(5, http_probe_timeout_s)))
-                except Exception as exc:
-                    err_log.append(f"model-list:http: {str(exc).strip()[:180]}")
-            if has_ollama_cli:
-                try:
-                    discovered.extend(_list_ollama_models_cli(timeout_s=min(8, cli_timeout_s)))
-                except Exception as exc:
-                    err_log.append(f"model-list:cli: {str(exc).strip()[:180]}")
+    engine = "heuristic"
+    text = ""
+    chosen_model = ""
+    err_log = []
 
-            discovered = _unique_preserve(discovered)
-            if discovered:
-                ranked_all = _rank_model_candidates(discovered, prefer_local=True)
-                # Configured model is ALWAYS first; discovered models are fallbacks only.
-                model_candidates = _unique_preserve([model] + ranked_all)
-        model_candidates = model_candidates[:max_model_candidates]
-
-        # Choose the fastest working engine/model; don't attempt HTTP if not reachable.
-        engine = "heuristic"
-        text = ""
-        chosen_model = ""
-        deadline = time.time() + total_budget_s
-        if has_ollama_http and requests is not None:
-            for candidate in model_candidates:
-                if text:
-                    break
-                remain = int(deadline - time.time())
-                if remain <= 0:
-                    err_log.append("http: budget exhausted")
-                    break
-                engine = "ollama_http"
-                try:
-                    # Fast HTTP probe first; if it times out we'll attempt CLI for same model.
-                    per_call_timeout = max(10, min(http_timeout_s, remain))
-                    text, meta = _call_ollama_http(
-                        model=candidate,
-                        prompt=prompt,
-                        timeout_s=per_call_timeout,
-                        with_meta=True,
-                    )
-                    # If response appears truncated (or model says length), do one retry with larger generation budget.
-                    if text and (
-                        meta.get("done_reason") == "length" or _llm_output_looks_incomplete(text)
-                    ):
-                        remain_retry = int(deadline - time.time())
-                        if remain_retry > 8:
-                            retry_predict = _env_int("SC0PE_AI_OLLAMA_RETRY_NUM_PREDICT", 1400, min_value=256, max_value=8192)
-                            try:
-                                retry_text, retry_meta = _call_ollama_http(
-                                    model=candidate,
-                                    prompt=prompt,
-                                    timeout_s=max(10, min(http_timeout_s, remain_retry)),
-                                    num_predict_override=retry_predict,
-                                    with_meta=True,
-                                )
-                                if retry_text and len(retry_text) >= len(text):
-                                    text, meta = retry_text, retry_meta
-                            except Exception as retry_exc:
-                                err_log.append(f"http:{candidate}: retry failed: {str(retry_exc).strip()[:160]}")
-                    if text:
-                        chosen_model = candidate
-                        break
-                except Exception as exc:
-                    err_msg = str(exc).strip()
-                    err_log.append(f"http:{candidate}: {err_msg[:180]}")
-                    # If HTTP timed out, try one direct CLI retry for the same model.
-                    if (not text) and has_ollama_cli and ("timed out" in err_msg.lower()):
-                        if skip_cloud_cli and _is_probably_cloud_model(candidate):
-                            err_log.append(f"cli:{candidate}: skipped (cloud model)")
-                            continue
-                        remain_cli = int(deadline - time.time())
-                        if remain_cli > 10:
-                            try:
-                                engine = "ollama_cli"
-                                per_cli_timeout = max(20, min(cli_timeout_s, remain_cli))
-                                text = _call_ollama_cli(model=candidate, prompt=prompt, timeout_s=per_cli_timeout)
-                                if text:
-                                    chosen_model = candidate
-                                    break
-                            except Exception as cli_exc:
-                                err_log.append(f"cli:{candidate}: {str(cli_exc).strip()[:180]}")
-        if not text and has_ollama_cli:
-            for candidate in model_candidates:
-                if skip_cloud_cli and _is_probably_cloud_model(candidate):
-                    err_log.append(f"cli:{candidate}: skipped (cloud model)")
-                    continue
-                remain = int(deadline - time.time())
-                if remain <= 0:
-                    err_log.append("cli: budget exhausted")
-                    break
-                engine = "ollama_cli"
-                try:
-                    per_call_timeout = max(10, min(cli_timeout_s, remain))
-                    text = _call_ollama_cli(model=candidate, prompt=prompt, timeout_s=per_call_timeout)
-                    if text:
-                        chosen_model = candidate
-                        break
-                except Exception as exc:
-                    err_log.append(f"cli:{candidate}: {str(exc).strip()[:180]}")
-        if not text:
-            engine = "heuristic"
-            text = _heuristic_fallback(summary)
-            if err_log:
-                print("[bold cyan][[bold red]![bold cyan]][white] Ollama call failed; fallback mode enabled.")
-                for ln in err_log[:4]:
-                    print(f"[bold cyan][[bold red]![bold cyan]][white] {ln}")
-                print("[bold cyan][[bold red]*[bold cyan]][white] Verify model name or run: [bold yellow]ollama pull <model>[white]")
+    if provider in CLOUD_PROVIDERS:
+        cloud_timeout_s = _env_int("SC0PE_AI_CLOUD_HTTP_TIMEOUT", 90, min_value=10, max_value=3600)
+        # Respect the overall AI budget (e.g. fast_mode's tighter
+        # SC0PE_AI_TOTAL_BUDGET=45 for --archive) the same way the Ollama
+        # branch below does -- otherwise a cloud call could run well past
+        # the caller's intended time cap.
+        cloud_timeout_s = min(cloud_timeout_s, total_budget_s)
+        key_present = bool(_cloud_api_key(provider))
+        if not key_present:
+            env_name, _key_file = _PROVIDER_KEY_SOURCE[provider]
+            print(f"[bold cyan][[bold red]![bold cyan]][white] No {provider} API key found. Falling back to heuristic analysis.")
+            print(f"[bold cyan][[bold red]*[bold cyan]][white] Set {env_name} or run: qu1cksc0pe.py --key_init --key_provider {provider}")
+            status_msg = "[bold magenta][[bold yellow]*[bold magenta]][bold white] HEURISTIC ANALYSIS IN PROGRESS, PLEASE WAIT..."
         else:
-            model = chosen_model or model
+            status_msg = f"[bold magenta][[bold yellow]*[bold magenta]][bold white] AI QUERY IN PROGRESS ({provider.upper()}), PLEASE WAIT..."
+
+        if RICH_CONSOLE is None:
+            print(status_msg)
+        status_ctx = RICH_CONSOLE.status(status_msg, spinner="bouncingBar", spinner_style="bold magenta") if RICH_CONSOLE is not None else nullcontext()
+        with status_ctx:
+            if key_present:
+                try:
+                    if provider == "claude":
+                        text, chosen_model = _call_claude_api(prompt, timeout_s=cloud_timeout_s)
+                    else:
+                        text, chosen_model = _call_openai_compatible_api(provider, prompt, timeout_s=cloud_timeout_s)
+                    engine = provider
+                except Exception as exc:
+                    err_log.append(f"{provider}: {str(exc).strip()[:220]}")
+            if not text:
+                engine = "heuristic"
+                text = _heuristic_fallback(summary)
+                if err_log:
+                    print(f"[bold cyan][[bold red]![bold cyan]][white] {provider} call failed; fallback mode enabled.")
+                    for ln in err_log[:4]:
+                        print(f"[bold cyan][[bold red]![bold cyan]][white] {ln}")
+            else:
+                model = chosen_model or model
+    else:
+        # Warn user early if Ollama is not available.
+        has_ollama_http = _probe_ollama_http()
+        has_ollama_cli = bool(shutil.which("ollama"))
+        status_msg = ""
+        if not has_ollama_http and not has_ollama_cli:
+            print("[bold cyan][[bold red]![bold cyan]][white] Ollama not found or not reachable. Falling back to heuristic analysis.")
+            print("[bold cyan][[bold red]*[bold cyan]][white] Install Ollama or set OLLAMA_HOST (default: http://127.0.0.1:11434).")
+            status_msg = "[bold magenta][[bold yellow]*[bold magenta]][bold white] HEURISTIC ANALYSIS IN PROGRESS, PLEASE WAIT..."
+        else:
+            status_msg = "[bold magenta][[bold yellow]*[bold magenta]][bold white] AI QUERY IN PROGRESS, PLEASE WAIT..."
+
+        if RICH_CONSOLE is None:
+            print(status_msg)
+        status_ctx = RICH_CONSOLE.status(status_msg, spinner="bouncingBar", spinner_style="bold magenta") if RICH_CONSOLE is not None else nullcontext()
+        with status_ctx:
+            # Prefer configured model, but optionally fall back to available local models.
+            model_candidates = [model]
+            err_log = []
+            allow_model_fallback = _env_bool("SC0PE_AI_ALLOW_MODEL_FALLBACK", True)
+            skip_cloud_cli = _env_bool("SC0PE_AI_SKIP_CLOUD_CLI", True)
+            max_model_candidates = _env_int("SC0PE_AI_MAX_MODEL_CANDIDATES", 4, min_value=1, max_value=20)
+            if allow_model_fallback and (has_ollama_http or has_ollama_cli):
+                discovered = []
+                if has_ollama_http and requests is not None:
+                    try:
+                        discovered.extend(_list_ollama_models_http(timeout_s=min(5, http_probe_timeout_s)))
+                    except Exception as exc:
+                        err_log.append(f"model-list:http: {str(exc).strip()[:180]}")
+                if has_ollama_cli:
+                    try:
+                        discovered.extend(_list_ollama_models_cli(timeout_s=min(8, cli_timeout_s)))
+                    except Exception as exc:
+                        err_log.append(f"model-list:cli: {str(exc).strip()[:180]}")
+
+                discovered = _unique_preserve(discovered)
+                if discovered:
+                    ranked_all = _rank_model_candidates(discovered, prefer_local=True)
+                    # Configured model is ALWAYS first; discovered models are fallbacks only.
+                    model_candidates = _unique_preserve([model] + ranked_all)
+            model_candidates = model_candidates[:max_model_candidates]
+
+            # Choose the fastest working engine/model; don't attempt HTTP if not reachable.
+            engine = "heuristic"
+            text = ""
+            chosen_model = ""
+            deadline = time.time() + total_budget_s
+            if has_ollama_http and requests is not None:
+                for candidate in model_candidates:
+                    if text:
+                        break
+                    remain = int(deadline - time.time())
+                    if remain <= 0:
+                        err_log.append("http: budget exhausted")
+                        break
+                    engine = "ollama_http"
+                    try:
+                        # Fast HTTP probe first; if it times out we'll attempt CLI for same model.
+                        per_call_timeout = max(10, min(http_timeout_s, remain))
+                        text, meta = _call_ollama_http(
+                            model=candidate,
+                            prompt=prompt,
+                            timeout_s=per_call_timeout,
+                            with_meta=True,
+                        )
+                        # If response appears truncated (or model says length), do one retry with larger generation budget.
+                        if text and (
+                            meta.get("done_reason") == "length" or _llm_output_looks_incomplete(text)
+                        ):
+                            remain_retry = int(deadline - time.time())
+                            if remain_retry > 8:
+                                retry_predict = _env_int("SC0PE_AI_OLLAMA_RETRY_NUM_PREDICT", 1400, min_value=256, max_value=8192)
+                                try:
+                                    retry_text, retry_meta = _call_ollama_http(
+                                        model=candidate,
+                                        prompt=prompt,
+                                        timeout_s=max(10, min(http_timeout_s, remain_retry)),
+                                        num_predict_override=retry_predict,
+                                        with_meta=True,
+                                    )
+                                    if retry_text and len(retry_text) >= len(text):
+                                        text, meta = retry_text, retry_meta
+                                except Exception as retry_exc:
+                                    err_log.append(f"http:{candidate}: retry failed: {str(retry_exc).strip()[:160]}")
+                        if text:
+                            chosen_model = candidate
+                            break
+                    except Exception as exc:
+                        err_msg = str(exc).strip()
+                        err_log.append(f"http:{candidate}: {err_msg[:180]}")
+                        # If HTTP timed out, try one direct CLI retry for the same model.
+                        if (not text) and has_ollama_cli and ("timed out" in err_msg.lower()):
+                            if skip_cloud_cli and _is_probably_cloud_model(candidate):
+                                err_log.append(f"cli:{candidate}: skipped (cloud model)")
+                                continue
+                            remain_cli = int(deadline - time.time())
+                            if remain_cli > 10:
+                                try:
+                                    engine = "ollama_cli"
+                                    per_cli_timeout = max(20, min(cli_timeout_s, remain_cli))
+                                    text = _call_ollama_cli(model=candidate, prompt=prompt, timeout_s=per_cli_timeout)
+                                    if text:
+                                        chosen_model = candidate
+                                        break
+                                except Exception as cli_exc:
+                                    err_log.append(f"cli:{candidate}: {str(cli_exc).strip()[:180]}")
+            if not text and has_ollama_cli:
+                for candidate in model_candidates:
+                    if skip_cloud_cli and _is_probably_cloud_model(candidate):
+                        err_log.append(f"cli:{candidate}: skipped (cloud model)")
+                        continue
+                    remain = int(deadline - time.time())
+                    if remain <= 0:
+                        err_log.append("cli: budget exhausted")
+                        break
+                    engine = "ollama_cli"
+                    try:
+                        per_call_timeout = max(10, min(cli_timeout_s, remain))
+                        text = _call_ollama_cli(model=candidate, prompt=prompt, timeout_s=per_call_timeout)
+                        if text:
+                            chosen_model = candidate
+                            break
+                    except Exception as exc:
+                        err_log.append(f"cli:{candidate}: {str(exc).strip()[:180]}")
+            if not text:
+                engine = "heuristic"
+                text = _heuristic_fallback(summary)
+                if err_log:
+                    print("[bold cyan][[bold red]![bold cyan]][white] Ollama call failed; fallback mode enabled.")
+                    for ln in err_log[:4]:
+                        print(f"[bold cyan][[bold red]![bold cyan]][white] {ln}")
+                    print("[bold cyan][[bold red]*[bold cyan]][white] Verify model name or run: [bold yellow]ollama pull <model>[white]")
+            else:
+                model = chosen_model or model
 
     # Print AI output
     llm_iocs = _extract_llm_iocs(text)
@@ -1767,7 +1973,7 @@ def main():
             },
         },
         "engine": engine,
-        "model": model if engine.startswith("ollama") else "",
+        "model": model if engine.startswith("ollama") or engine in CLOUD_PROVIDERS else "",
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "output": text_clean,
     }

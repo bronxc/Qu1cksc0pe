@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "qu1cksc0pe": {
+      "command": "python3",
+      "args": ["qu1cksc0pe.py", "--mcp"],
+      "env": {
+        "SC0PE_MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
