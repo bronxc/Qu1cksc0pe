@@ -113,13 +113,20 @@ def execute_module(target, path=MODULE_PREFIX, invoker=py_binary):
     parts  = target.split(" ", 1)
     script = parts[0]
     extra  = f" {parts[1]}" if len(parts) > 1 else ""
-    # cmd.exe's `/c` only preserves quoting cleanly when the command string
-    # contains exactly two quote characters; with more (invoker path quoted
-    # *and* script path quoted, as below) it falls back to stripping just the
-    # first and last quote, mangling everything in between. Wrapping the
-    # whole command in one more outer quote pair is the standard workaround.
     inner_command = f'"{invoker}" "{path}{script}"{extra}'
-    os.system(f'"{inner_command}"')
+    if sys.platform == "win32":
+        # cmd.exe's `/c` only preserves quoting cleanly when the command string
+        # contains exactly two quote characters; with more (invoker path quoted
+        # *and* script path quoted, as below) it falls back to stripping just the
+        # first and last quote, mangling everything in between. Wrapping the
+        # whole command in one more outer quote pair is the standard workaround.
+        # POSIX shells don't share this quirk -- an extra outer quote pair there
+        # flips the quote-toggle parity for every char after it, turning the
+        # separator spaces between args into literal quoted spaces and merging
+        # the whole command into a single unresolvable word.
+        os.system(f'"{inner_command}"')
+    else:
+        os.system(inner_command)
 
 # Only the *stdio* MCP transport talks JSON-RPC over this process's own
 # stdout, so only that mode requires suppressing the startup banner. Other
