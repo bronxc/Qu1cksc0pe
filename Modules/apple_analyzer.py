@@ -7,12 +7,19 @@ import re
 import sys
 import json
 
-from utils.helpers import err_exit, get_argv, save_report
+try:
+    from utils.helpers import err_exit, get_argv, save_report
+except ModuleNotFoundError:
+    from Modules.utils.helpers import err_exit, get_argv, save_report
 
 try:
     from wh1tem0cha import Wh1teM0cha
 except Exception:
-    err_exit("Error: >wh1tem0cha< module not found.")
+    # AppleScript source analysis does not need the Mach-O parser. Keep the
+    # module importable so document_analyzer.py can delegate misleadingly
+    # named text files here even when the optional binary dependency is not
+    # installed.
+    Wh1teM0cha = None
 
 try:
     from rich import print
@@ -21,14 +28,20 @@ except Exception:
     err_exit("Error: >rich< module not found.")
 
 try:
-    from analysis.multiple.multi import chk_wlist, yara_rule_scanner
+    try:
+        from analysis.multiple.multi import chk_wlist, yara_rule_scanner
+    except ModuleNotFoundError:
+        from Modules.analysis.multiple.multi import chk_wlist, yara_rule_scanner
 except Exception:
     def chk_wlist(s):
         return True
     yara_rule_scanner = None
 
 try:
-    from analysis.multiple.go_binary_parser import GolangParser
+    try:
+        from analysis.multiple.go_binary_parser import GolangParser
+    except ModuleNotFoundError:
+        from Modules.analysis.multiple.go_binary_parser import GolangParser
     _GOLANG_PARSER_AVAILABLE = True
 except Exception:
     _GOLANG_PARSER_AVAILABLE = False
@@ -189,6 +202,186 @@ def _is_suspicious_dylib(lib_name):
     return False
 
 
+# ----------------------------------------------------------------------
+# AppleScript source analysis
+# ----------------------------------------------------------------------
+
+_APPLESCRIPT_HANDLER = re.compile(
+    r"(?im)^\s*on\s+[A-Za-z_][\w-]*\s*\([^\r\n]*\)\s*$"
+)
+_APPLESCRIPT_SIGNALS = (
+    re.compile(r"(?im)^\s*do\s+shell\s+script\b"),
+    re.compile(r"(?im)^\s*tell\s+application\b"),
+    re.compile(r"(?im)^\s*repeat\s+with\b"),
+    re.compile(r"(?im)^\s*display\s+dialog\b"),
+    re.compile(r"(?im)^\s*set\s+.+?\s+to\b"),
+    re.compile(r"(?i)\bquoted\s+form\s+of\b"),
+    re.compile(r"(?i)\bPOSIX\s+(?:path|file)\b"),
+    re.compile(r"(?im)^\s*end\s+try\s*$"),
+)
+
+_APPLESCRIPT_PATTERNS = {
+    "Execution": [
+        r"\bdo\s+shell\s+script\b",
+        r"\bosascript\b",
+        r"\bopen\s+location\b",
+    ],
+    "Network": [r"\bcurl\b", r"\bwget\b"],
+    "CredentialAccess": [
+        r"\bdscl\s+\.\s+authonly\b",
+        r"\bfind-generic-password\b",
+        r"\bhidden\s+answer\b",
+        r"(?:~/|/Users/[^/]+/)?Library/Keychains",
+        r"\bCookies\.binarycookies\b",
+        r"\bLogin Data\b",
+    ],
+    "Collection": [
+        r"~/\.(?:ssh|aws|kube)\b",
+        r"\b(?:ChromiumWallets|DesktopWallets|Filegrabber|Telegram|Keychains)\b",
+        r"\b(?:system_profiler|lsappinfo|ps\s+ax)\b",
+    ],
+    "Persistence": [
+        r"(?:~/)?Library/LaunchAgents",
+        r"/Library/LaunchDaemons",
+        r"\blaunchctl\b",
+        r"\bcrontab\b",
+    ],
+    "DefenseEvasion": [r"\bcodesign\b", r"\bkillall\b", r"\bxattr\b"],
+    "FileSystem": [
+        r"\b(?:cp|mv|rm|mkdir|ditto|unzip)\b",
+        r"\bopen\s+for\s+access\b",
+        r"\bwrite\s+.+?\s+to\b",
+    ],
+}
+
+_APPLESCRIPT_SHELL_COMMAND = re.compile(
+    r'\bdo\s+shell\s+script\s+"((?:\\.|[^"\\])*)"', re.IGNORECASE
+)
+_APPLESCRIPT_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _decode_source_bytes(data):
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le", errors="ignore")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be", errors="ignore")
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", errors="ignore")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1", errors="ignore")
+
+
+def _safe_source_text(value):
+    return "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in str(value))
+
+
+def looks_like_applescript(source):
+    """Recognize AppleScript even when malware uses a misleading extension."""
+    if not source:
+        return False
+    score = sum(bool(pattern.search(source)) for pattern in _APPLESCRIPT_SIGNALS)
+    has_handler = bool(_APPLESCRIPT_HANDLER.search(source))
+    has_primary_action = bool(_APPLESCRIPT_SIGNALS[0].search(source) or
+                              _APPLESCRIPT_SIGNALS[1].search(source))
+    return (has_handler and score >= 2) or (has_primary_action and score >= 4)
+
+
+def is_applescript_file(path):
+    """Content-based routing check used by Qu1cksc0pe's --analyze path."""
+    try:
+        with open(path, "rb") as source_file:
+            return looks_like_applescript(_decode_source_bytes(source_file.read()))
+    except (OSError, ValueError):
+        return False
+
+
+def analyze_applescript_source(source):
+    """Return static behavior and IOC results for AppleScript source text."""
+    categories = {}
+    for category, patterns in _APPLESCRIPT_PATTERNS.items():
+        hits = []
+        seen = set()
+        for pattern in patterns:
+            for match in re.finditer(pattern, source, re.IGNORECASE):
+                value = _safe_source_text(match.group(0).strip())
+                key = value.casefold()
+                if value and key not in seen:
+                    seen.add(key)
+                    hits.append(value)
+        categories[category] = hits
+
+    shell_commands = []
+    seen_commands = set()
+    for match in _APPLESCRIPT_SHELL_COMMAND.finditer(source):
+        command = _safe_source_text(match.group(1).strip()).replace(r'\"', '"')
+        if command and command not in seen_commands:
+            seen_commands.add(command)
+            shell_commands.append(command)
+
+    urls = []
+    seen_urls = set()
+    for match in _APPLESCRIPT_URL.finditer(source):
+        url = match.group(0).rstrip(".,;:)]}>")
+        if not url or url in seen_urls:
+            continue
+        try:
+            allowed = chk_wlist(url)
+        except Exception:
+            allowed = True
+        if allowed:
+            seen_urls.add(url)
+            urls.append(url)
+
+    return {
+        "language": "AppleScript",
+        "categories": categories,
+        "shell_commands": shell_commands,
+        "extracted_urls": urls,
+    }
+
+
+def render_applescript_analysis(result):
+    """Render analyze_applescript_source() output using Qu1cksc0pe tables."""
+    categories = result.get("categories", {})
+    summary = Table(title="* AppleScript Pattern Summary *",
+                    title_style="bold italic cyan", title_justify="center")
+    summary.add_column("[bold green]Category", justify="center")
+    summary.add_column("[bold green]Count", justify="center")
+    for category, hits in categories.items():
+        summary.add_row(f"[bold red]{category}" if hits else category, str(len(hits)))
+    print(summary)
+
+    for category, hits in categories.items():
+        if not hits:
+            continue
+        table = Table(title=f"* {category} Matches *",
+                      title_style="bold italic cyan", title_justify="center")
+        table.add_column("[bold green]Matched Value", justify="left")
+        for hit in hits[:50]:
+            table.add_row(hit)
+        print(table)
+
+    commands = result.get("shell_commands", [])
+    if commands:
+        table = Table(title="* Potential Shell Commands *",
+                      title_style="bold italic cyan", title_justify="center")
+        table.add_column("[bold green]Command", justify="center")
+        for command in commands[:100]:
+            table.add_row(command)
+        print(table)
+
+    urls = result.get("extracted_urls", [])
+    if urls:
+        table = Table(title="* Extracted URLs *",
+                      title_style="bold italic cyan", title_justify="center")
+        table.add_column("[bold green]URL", justify="center")
+        for url in urls:
+            table.add_row(url)
+        print(table)
+
+
 class AppleAnalyzer:
     def __init__(self, target_file):
         self.target_file = target_file
@@ -227,6 +420,7 @@ class AppleAnalyzer:
             "crypto_addresses":       {},
             "suspicious_strings":     {},
             "base64_blobs":           [],
+            "applescript":            {},
             "categorized_patterns":   {},
             "risk_score":             0,
             "risk_level":             "",
@@ -259,6 +453,8 @@ class AppleAnalyzer:
         return sum(1 for m in markers if m in self._target_binary_buff) > 0
 
     def _check_macho_binary(self):
+        if Wh1teM0cha is None:
+            return False
         wm = Wh1teM0cha(self.target_file)
         try:
             wm.get_binary_info()
@@ -273,7 +469,13 @@ class AppleAnalyzer:
             print(f"{infoS} Detected format: [bold green]{magic_label}[white]")
             self.report["binary_info"]["format"] = magic_label
 
-        if self._check_macho_binary():
+        # Do not decode/regex-scan an entire Mach-O as text. AppleScript
+        # detection is only meaningful when no binary magic was identified.
+        source_text = "" if magic_label else _decode_source_bytes(self._target_binary_buff)
+        if not magic_label and looks_like_applescript(source_text):
+            self.report["target_type"] = "applescript"
+            self.analyze_applescript(source_text)
+        elif self._check_macho_binary():
             self.report["target_type"] = "mach-o"
             self.analyze_macho_binary()
         elif self._check_ipa_file():
@@ -284,6 +486,40 @@ class AppleAnalyzer:
             print(f"{errorS} Unknown file type!")
             self.report["target_type"] = "unknown"
             self.report["errors"].append("unknown_file_type")
+
+    def analyze_applescript(self, source_text=None):
+        """Analyze AppleScript source without executing osascript or commands."""
+        if source_text is None:
+            source_text = _decode_source_bytes(self._target_binary_buff)
+
+        print(f"{infoS} Computing file hashes...")
+        self._compute_file_hashes()
+        print(f"\n{infoS} Performing AppleScript static analysis...")
+        result = analyze_applescript_source(source_text)
+        render_applescript_analysis(result)
+
+        self.report["analysis_type"] = "AppleScript"
+        self.report["target_os"] = "OSX"
+        self.report["target_type"] = "applescript"
+        self.report["applescript"] = result
+        self.report["extracted_urls"] = list(result.get("extracted_urls", []))
+        self.report["suspicious_strings"] = {
+            category: hits for category, hits in result.get("categories", {}).items() if hits
+        }
+
+        categories = result.get("categories", {})
+        if categories.get("Network") or result.get("extracted_urls"):
+            self._add_risk("download_staging", "AppleScript downloads or references remote content")
+        if categories.get("CredentialAccess"):
+            self._add_risk("c2_artifact", "AppleScript accesses credentials, cookies, or keychains")
+        if categories.get("Collection"):
+            self._add_risk("anti_analysis", "AppleScript collects browser, wallet, cloud, or host data")
+        if categories.get("DefenseEvasion"):
+            self._add_risk("anti_analysis", "AppleScript uses defense-evasion or tampering commands")
+
+        print(f"\n{infoS} Running YARA rules...")
+        self._scan_yara()
+        self._finalise_risk_score()
 
     # ------------------------------------------------------------------
     # File hashes

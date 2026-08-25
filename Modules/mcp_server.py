@@ -324,7 +324,12 @@ def _run_cli(args: list, *, timeout: int = 300) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def analyze_file(file_path: str, ai: bool = False, ai_provider: Optional[str] = None, timeout_seconds: int = 900) -> dict[str, Any]:
+def analyze_file(
+    file_path: str,
+    ai: bool = False,
+    ai_provider: Optional[str] = None,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
     """Auto-detect a file's type and run Qu1cksc0pe's full static analysis on it.
 
     Handles Windows PE/MSI/DLL, Linux ELF, macOS Mach-O, Android APK/DEX/JAR,
@@ -338,8 +343,20 @@ def analyze_file(file_path: str, ai: bool = False, ai_provider: Optional[str] = 
     "kimi", or "glm" -- each needing configure_ai_api_key(provider=...)
     first. Cloud providers add network latency and send report data
     off-machine.
+
+    Any detected VBScript/VBA source is automatically run through
+    Qu1cksc0pe's native sandboxed behavior-emulation engine (fake
+    CreateObject/filesystem/registry/network/process APIs -- nothing real
+    ever executes). Adds a "findings"/"ioc_events"/... "emulation" section
+    to the returned report's document sub-report -- findings are individual
+    detected patterns (each with its own severity), not blended into a
+    single aggregate risk score. No effect on non-script file types.
+    Emulation runs in addition to normal static analysis with a fixed 15s
+    per-script/project safety budget, so raise timeout_seconds for large or
+    heavily obfuscated inputs when necessary.
     """
-    _log_call("analyze_file", file_path=file_path, ai=ai, ai_provider=ai_provider, timeout_seconds=timeout_seconds)
+    _log_call("analyze_file", file_path=file_path, ai=ai, ai_provider=ai_provider,
+               timeout_seconds=timeout_seconds)
     try:
         path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)
@@ -354,13 +371,19 @@ def analyze_file(file_path: str, ai: bool = False, ai_provider: Optional[str] = 
 
 
 @mcp.tool()
-def analyze_document(file_path: str, ai: bool = False, ai_provider: Optional[str] = None, timeout_seconds: int = 600) -> dict[str, Any]:
+def analyze_document(
+    file_path: str,
+    ai: bool = False,
+    ai_provider: Optional[str] = None,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
     """Analyze a document/macro/VBScript-family file (.doc*, .xls*, .vbs, .vbe, .vba, .vb, .bas, .cls, .frm, ...).
 
     Equivalent to `qu1cksc0pe.py --file <file> --docs --report`. See
-    analyze_file's docstring for what ai/ai_provider do.
+    analyze_file's docstring for AI options and automatic emulation.
     """
-    _log_call("analyze_document", file_path=file_path, ai=ai, ai_provider=ai_provider, timeout_seconds=timeout_seconds)
+    _log_call("analyze_document", file_path=file_path, ai=ai, ai_provider=ai_provider,
+               timeout_seconds=timeout_seconds)
     try:
         path = _validate_file(file_path)
         provider_args = _ai_provider_args(ai_provider)

@@ -74,6 +74,9 @@ sc0pe_reports/
 sc0pe_*_report.json
 sc0pe_process-*.json
 qu1cksc0pe_memory_dump_*.bin
+qu1cksc0pe_carved*
+qu1cksc0pe_decrypted_*
+carved.bmp
 temp.txt
 .target-file.txt
 .target-folder.txt
@@ -136,12 +139,80 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+sc0pe/
+sc0pe_venv/
+.direnv/
+.envrc
+
+# Secrets and local credentials
+# Keep real credentials out of the repository. Sanitized examples can still
+# be committed via the explicit .env exceptions above.
+.qu1cksc0pe_path
+sc0pe_Base/
+sc0pe_*_apikey.txt
+*_apikey.txt
+*_api_key.txt
+credentials.json
+auth.json
+secrets.json
+token.json
+tokens.json
+client_secret*.json
+service_account*.json
+service-account*.json
+cookies.txt
+cookies.json
+.netrc
+.pypirc
+.npmrc
+pip.conf
+.ssh/
+.gnupg/
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+*.ovpn
+*.tfvars
+*.tfvars.json
+.terraform/
+.aws/
+.azure/
+.gcloud/
+.kube/
+
+# Potentially sensitive analyst captures and crash/process dumps
+*.pcap
+*.pcapng
+*.har
+*.dmp
+*.core
+/core
+/core.*
+
+# Editor backups/history can retain deleted secrets or sample content
+*.swp
+*.swo
+*~
+.history/
 
 # Spyder project settings
 .spyderproject

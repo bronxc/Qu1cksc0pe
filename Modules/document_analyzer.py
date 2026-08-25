@@ -13,12 +13,136 @@ import subprocess
 import configparser
 import urllib.parse
 from analysis.multiple.multi import chk_wlist, perform_strings, yara_rule_scanner, calc_hashes
+from apple_analyzer import looks_like_applescript
+from batch_analyzer import looks_like_batch_script
 from utils.helpers import err_exit, get_argv, save_report
+
+# Checking for the native VBA/VBScript sandboxed behavior-emulation engine.
+# Self-contained (no external dependency) -- soft-fail like msoffcrypto
+# below so a missing emulator never prevents the normal document analysis.
+try:
+    from vba_emulator import (emulate_vba_source, extract_activex_control_values,
+                               extract_custom_document_properties, extract_custom_xml_parts,
+                               extract_customui_callbacks, extract_shape_macro_callbacks,
+                               extract_excel_cell_values)
+except Exception:
+    emulate_vba_source = None
+    extract_activex_control_values = None
+    extract_custom_document_properties = None
+    extract_custom_xml_parts = None
+    extract_customui_callbacks = None
+    extract_shape_macro_callbacks = None
+    extract_excel_cell_values = None
+
+
+def _trunc(value, n=90):
+    s = str(value)
+    return s if len(s) <= n else f"{s[:n]}... ({len(s)} chars total)"
+
+
+_EMU_CATEGORY_STYLE = {
+    "process_create": "bold red",
+    "network_request": "bold magenta", "network_send": "bold magenta", "network_header": "magenta",
+    "registry_write": "bold yellow", "registry_delete": "bold yellow", "registry_read": "yellow",
+    "filesystem_write": "bold cyan", "filesystem_copy": "bold cyan", "filesystem_move": "bold cyan",
+    "filesystem_create": "cyan", "filesystem_delete": "cyan", "filesystem_access": "dim cyan",
+    "com_create": "blue", "com_getobject": "blue",
+    "dynamic_execute": "bold green",
+    "decode_base64": "bold green", "decode_hex": "bold green",
+    "script_output": "bold white", "script_error": "bold red", "script_error_suppressed": "red",
+    "emulation_error": "bold red", "emulation_timeout": "bold red", "parse_error": "bold red",
+    "environment_write": "yellow", "environment_access": "dim yellow",
+    "unknown_com_call": "dim", "ui_prompt": "bold white", "wmi_query": "bold red",
+    "entry_point_invoked": "bold", "unsupported": "dim",
+    "stream_write": "bold cyan", "doc_property_access": "blue",
+    "filesystem_extract": "bold cyan", "com_namespace": "blue",
+    "process_injection": "bold red", "unmodeled_winapi_call": "dim",
+    "scheduled_task_create": "bold yellow",
+}
+
+
+def _humanize_emulation_event(category, f):
+    if category == "com_create":
+        return f"CreateObject(\"{f.get('progid')}\")" + ("" if f.get("known") else "  [not modeled]")
+    if category == "com_getobject":
+        return f"GetObject(\"{f.get('moniker','')}\", \"{f.get('progid','')}\")"
+    if category == "dynamic_execute":
+        return f"{f.get('api')}: {_trunc(f.get('code_preview',''))}"
+    if category == "process_create":
+        extra = []
+        if "window_style" in f:
+            extra.append(f"window_style={f['window_style']}")
+        if "wait" in f:
+            extra.append(f"wait={f['wait']}")
+        suffix = f"  ({', '.join(extra)})" if extra else ""
+        return f"{f.get('api')}: {_trunc(f.get('command',''), 200)}{suffix}"
+    if category in ("network_request", "network_send"):
+        return f"{f.get('api')}: {f.get('method','')} {f.get('url','')}".strip()
+    if category == "network_header":
+        return f"setRequestHeader: {f.get('name')} = {_trunc(f.get('value',''))}"
+    if category in ("registry_write", "registry_delete", "registry_read"):
+        val = f" = {_trunc(f.get('value',''))}" if f.get("value") else ""
+        persist = "  [PERSISTENCE]" if f.get("persistence") else ""
+        return f"{f.get('api')}: {f.get('key','')}{val}{persist}"
+    if category in ("filesystem_write", "filesystem_create", "filesystem_delete", "filesystem_access"):
+        susp = "  [suspicious ext]" if f.get("suspicious_ext") else ""
+        executable = f"  [executable content: {f.get('magic', 'unknown')}]" if f.get("executable_content") else ""
+        size = f"  ({f['size']} bytes)" if f.get("size") else ""
+        return f"{f.get('api')}: {f.get('path','')}{size}{susp}{executable}"
+    if category in ("filesystem_copy", "filesystem_move"):
+        susp = "  [suspicious ext]" if f.get("suspicious_ext") else ""
+        return f"{f.get('api')}: {f.get('src','')}  ->  {f.get('dst','')}{susp}"
+    if category == "stream_write":
+        return f"{f.get('api')}: {f.get('size',0)} bytes" + (f" - {_trunc(f['preview'])}" if f.get("preview") else "")
+    if category in ("environment_write", "environment_access"):
+        val = f" = {_trunc(f.get('value',''))}" if f.get("value") else ""
+        return f"Environment[{f.get('name','')}]{val}"
+    if category == "filesystem_extract":
+        return f"{f.get('api')}: extracted into {f.get('destination','')}"
+    if category == "com_namespace":
+        return f"{f.get('api')}: {f.get('path','')}"
+    if category == "doc_property_access":
+        note = "" if f.get("recovered") else "  [not recovered]"
+        return f"{f.get('api')}: {f.get('name','')}{note}"
+    if category == "unknown_com_call":
+        args = ", ".join(_trunc(a, 30) for a in f.get("args", []))
+        return f"{f.get('progid')}.{f.get('member')}({args})  [not modeled -- logged only]"
+    if category == "process_injection":
+        extra = [f"{k}={v}" for k, v in f.items()
+                 if k not in ("category", "ts", "api") and v not in (None, "")]
+        return f"{f.get('api')}" + (f"  ({', '.join(extra)})" if extra else "")
+    if category == "scheduled_task_create":
+        action = f" -> {_trunc(f.get('action', ''), 120)}" if f.get("action") else ""
+        return f"{f.get('api')}: {f.get('task_path', f.get('name', ''))}{action}  [PERSISTENCE]"
+    if category == "unmodeled_winapi_call":
+        args = ", ".join(_trunc(a, 30) for a in f.get("args", []))
+        lib = f" [{f['lib']}]" if f.get("lib") else ""
+        return f"{f.get('api')}{lib}({args})  [not modeled -- logged only]"
+    if category == "script_output":
+        return f"{f.get('api')}: {_trunc(f.get('text',''), 200)}"
+    if category == "ui_prompt":
+        return f"{f.get('api')}: {_trunc(f.get('text',''))}"
+    if category in ("script_error", "script_error_suppressed"):
+        return f"Runtime error #{f.get('number')}: {f.get('error')}"
+    if category in ("emulation_error", "emulation_timeout", "parse_error"):
+        return f"{f.get('error', f.get('detail',''))}" + (f"  (phase: {f['phase']})" if f.get("phase") else "")
+    if category == "entry_point_invoked":
+        return f"Invoking entry point: {f.get('name')}"
+    if category == "wmi_query":
+        return f"{f.get('api')}: {_trunc(f.get('query',''))}"
+    if category in ("decode_base64", "decode_hex"):
+        return f"{f.get('api')}: {f.get('length',0)} bytes decoded"
+    if category == "unsupported":
+        return f.get("detail", "")
+    if category.endswith("_suppressed"):
+        return f"{f.get('api', '')}: {f.get('note', 'further occurrences suppressed')}"
+    return _trunc(str(f))
 
 # Checking for rich
 try:
     from rich import print
     from rich.table import Table
+    from rich.markup import escape as _esc
 except:
     err_exit("Error: >rich< not found.")
 
@@ -132,6 +256,14 @@ report = {
             "target_file": "",
             "exit_code": None
         }
+    },
+    # Sandboxed behavior-emulation results for every extracted VBA project
+    # and/or VB-family script. Emulation starts automatically whenever
+    # analyzable source is detected and the native engine is available.
+    "emulation": {
+        "enabled": False,
+        "macros": [],
+        "script": None
     }
 }
 
@@ -196,6 +328,125 @@ class DocumentAnalyzer:
                 "occurence": 0
             }
         }
+
+    def _emulation_available(self):
+        return emulate_vba_source is not None
+
+    def _run_emulation(self, code, origin, activex_controls=None, module_names=None,
+                        custom_doc_properties=None, custom_xml_parts=None, extra_entry_points=None,
+                        excel_cells=None):
+        """Automatically emulate extracted VBA/VBScript source in-memory."""
+        if not self._emulation_available():
+            return None
+        if not code or not code.strip():
+            return None
+        timeout_seconds = 15
+
+        # origin is (part of) the analyzed filename/macro path -- fully
+        # attacker-controlled. _sanitize_text() only replaces non-printable
+        # chars; it does NOT escape rich markup, so a filename containing
+        # "[...]" (plausible: social-engineered names, or one that happens
+        # to collide with real style tags like "[bold red]") gets silently
+        # swallowed or mis-rendered by rich's console print() otherwise.
+        # Confirmed: a file literally named "[bold red]HACKED[white]evil.vbs"
+        # printed as just "HACKEDevil.vbs" before this fix.
+        print(f"\n{infoS} Emulating [bold green]{_esc(self._sanitize_text(origin))}[white] "
+              f"(sandboxed, up to {timeout_seconds}s)...")
+        try:
+            result = emulate_vba_source(code, origin=origin, timeout_seconds=timeout_seconds,
+                                         activex_controls=activex_controls, module_names=module_names,
+                                         custom_doc_properties=custom_doc_properties,
+                                         custom_xml_parts=custom_xml_parts,
+                                         extra_entry_points=extra_entry_points,
+                                         excel_cells=excel_cells)
+        except Exception as exc:
+            print(f"{errorS} Emulation failed: {_esc(str(exc))}")
+            return None
+
+        report["emulation"]["enabled"] = True
+
+        # Emulation itself succeeded and its dict is what actually needs to
+        # survive (it's what --report saves) -- folding a couple of its
+        # fields into the rest of the report (findings, extracted URLs)
+        # must happen regardless of whether rendering it to the terminal
+        # works. Do the bookkeeping first, and isolate only the display
+        # call: without that isolation, any bug in
+        # _display_emulation_results would propagate out of
+        # VBScriptAnalysis()/MacroHunter() and, via the module's top-level
+        # exception handler, abort the *entire* analysis run (no report
+        # saved, no YARA/URL/pattern results either) over what should be,
+        # at worst, a cosmetic display issue -- and previously also
+        # silently discarded these real findings/URLs even when the
+        # underlying emulation result was fine.
+        for finding in result.get("findings", []):
+            self._add_finding("Emulation", finding.get("rule_id", "finding"))
+        for url in result.get("network_requests", []):
+            u = url.get("url")
+            if u:
+                self._append_unique("extracted_urls", u)
+        try:
+            self._display_emulation_results(result)
+        except Exception as exc:
+            print(f"{errorS} Emulation completed but rendering its results failed: {_esc(str(exc))}")
+
+        return result
+
+    def _display_emulation_results(self, result):
+        # Plain per-line output rather than rich Tables: a fixed-column
+        # table degrades badly once real payload chunks (multi-hundred-
+        # char base64 blobs, long command lines) show up. This mirrors
+        # VBEmu's own `--trace` CLI output style.
+        print(f"[dim]>>> Emulation finished "
+              f"({result.get('elapsed_seconds', 0)}s, {result.get('step_count', 0):,} steps)[white]")
+
+        for f in result.get("findings", []):
+            sev = f.get("severity", "info").upper()
+            sev_color = {"CRITICAL": "bold red", "HIGH": "bold red", "MEDIUM": "bold yellow",
+                         "LOW": "bold blue", "INFO": "white"}.get(sev, "white")
+            print(f"  [{sev_color}][{sev}][white] {_esc(f.get('title', ''))}")
+
+        events = result.get("ioc_events", [])
+        print(f"\n[bold cyan]Step-by-step call trace[white]  ({len(events)} events)")
+        if not events:
+            print("  [dim](no observable API calls -- script did nothing through a modeled API)[white]")
+        else:
+            t0 = events[0]["ts"]
+            for i, e in enumerate(events, 1):
+                cat = e["category"]
+                fields = {k: v for k, v in e.items() if k not in ("category", "ts")}
+                # Sample-controlled strings (paths, command lines, registry
+                # values, ...) may contain "[...]" sequences -- rich's
+                # console print() treats "[...]" as markup by default, so
+                # without escaping, e.g. a literal "[void]" in a payload
+                # silently vanishes from the trace instead of being shown.
+                desc = _esc(_humanize_emulation_event(cat, fields))
+                style = _EMU_CATEGORY_STYLE.get(cat, "")
+                cat_col = f"[{style}]{cat:<20}[white]" if style else f"{cat:<20}"
+                desc_col = f"[{style}]{desc}[white]" if style else desc
+                print(f"  [dim]{i:>4} t+{e['ts'] - t0:6.3f}s[white] {cat_col} {desc_col}")
+
+        net = [e for e in events if e["category"] in ("network_request", "network_send")]
+        print("\n[bold cyan]Network activity[white]")
+        if net:
+            for e in net:
+                fields = {k: v for k, v in e.items() if k not in ("category", "ts")}
+                style = _EMU_CATEGORY_STYLE.get(e["category"], "")
+                text = _esc(_humanize_emulation_event(e["category"], fields))
+                print(f"  [{style}]{text}[white]" if style else f"  {text}")
+        else:
+            print("  [dim]none observed at the VBA/VBS layer[white]")
+
+        if result.get("dropped_files"):
+            print("\n[bold cyan]Files written/copied[white]")
+            for d in result["dropped_files"]:
+                susp = "  [bold red][suspicious ext][/bold red]" if d.get("suspicious_ext") else ""
+                print(f"  [bold cyan]{_esc(d.get('path', ''))}[white]{susp}")
+
+        persist = [r for r in result.get("registry_changes", []) if r.get("persistence")]
+        if persist:
+            print("\n[bold cyan]Persistence[white]")
+            for r in persist:
+                print(f"  [bold yellow]{_esc(r.get('key', ''))}[white] = {_esc(r.get('value', ''))}")
 
     def _append_unique(self, key, value):
         if value and value not in report[key]:
@@ -348,7 +599,12 @@ class DocumentAnalyzer:
         lower_file = self.targetFile.lower()
         lower_magic = decoded_doc_type.lower()
         report["file_magic"] = decoded_doc_type.strip()
-        if lower_file.endswith((".vbs", ".vbe", ".vba", ".vb", ".bas", ".cls", ".frm")):
+        # Content/magic wins for HTML disguised with a VB-family suffix.
+        # Otherwise `payload.vba` beginning with <script language=VBScript>
+        # is fed to the bare VBA parser and fails on the markup itself.
+        if "html document" in lower_magic:
+            return "html"
+        if lower_file.endswith((".vbs", ".vbe", ".vba", ".vb", ".bas", ".cls", ".frm", ".applescript")):
             return "vbscript"
         elif "vbscript" in lower_magic or "visual basic" in lower_magic:
             return "vbscript"
@@ -356,14 +612,13 @@ class DocumentAnalyzer:
             return "javascript"
         if lower_file.endswith(".hta"):
             return "hta"
-        if "Microsoft Word" in decoded_doc_type or "Microsoft Excel" in decoded_doc_type or "Microsoft Office Word" in decoded_doc_type:
+        if ("Microsoft Word" in decoded_doc_type or "Microsoft Excel" in decoded_doc_type
+                or "Microsoft Office Word" in decoded_doc_type or "OOXML" in decoded_doc_type):
             return "docscan"
         elif "PDF document" in decoded_doc_type:
             return "pdfscan"
         elif self.targetFile.endswith(".one"): # TODO: Look for better solutions!
             return "onenote"
-        elif "HTML document" in decoded_doc_type:
-            return "html"
         elif ("Rich Text Format" in decoded_doc_type and binascii.unhexlify(b"7B5C72746631") in magic_buf) or (binascii.unhexlify(b"7B5C7274") in magic_buf):
             return "rtf"
         elif "Zip archive" in decoded_doc_type:
@@ -571,8 +826,108 @@ class DocumentAnalyzer:
                     report["macros"]["extracted"] = True
                     max_macro_chars = int(os.environ.get("SC0PE_REPORT_MAX_MACRO_CHARS", "50000"))
 
+                    # Populated below only when macro_state_vba != 0, but
+                    # referenced after the extraction section (see the
+                    # "Sandboxed behavior emulation" block past "Extraction
+                    # completed.") regardless of which macro type was found.
+                    activex_controls = {}
+                    custom_doc_properties = {}
+                    custom_xml_parts = {}
+                    customui_callbacks = []
+                    shape_callbacks = []
+                    excel_cells = {}
+                    modules_for_emulation = []
+
                     if macro_state_vba != 0:
-                        for mac in vbaparser.extract_all_macros():
+                        all_vba_macros = list(vbaparser.extract_all_macros())
+
+                        # Best-effort recovery of ActiveX form-control values
+                        # (see vba_emulator/activex_extractor.py) -- a real
+                        # technique where a macro's payload is hidden in a
+                        # hidden control's .Value/.Text instead of the code
+                        # itself, read back via ActiveDocument.<Name>.Value.
+                        # Needs every module's code (for the Attribute
+                        # VB_Control lines, in module order) plus the raw
+                        # OOXML zip bytes (for word/activeX/activeXN.bin) --
+                        # both already available here, so it's computed once
+                        # up front and threaded into each macro's emulation
+                        # run below.
+                        if extract_activex_control_values is not None:
+                            try:
+                                macro_sources_for_activex = [
+                                    (m[2] if len(m) > 2 else "", m[3] if len(m) > 3 else "")
+                                    for m in all_vba_macros
+                                ]
+                                activex_controls = extract_activex_control_values(
+                                    fileData, macro_sources_for_activex)
+                            except Exception:
+                                activex_controls = {}
+
+                        # Best-effort recovery of docProps/custom.xml values
+                        # (see vba_emulator/doc_properties_extractor.py) --
+                        # a real technique where a macro's payload is split
+                        # across custom document properties instead of
+                        # living in the macro source, read back via
+                        # ActiveDocument.CustomDocumentProperties(name).Value.
+                        if extract_custom_document_properties is not None:
+                            try:
+                                custom_doc_properties = extract_custom_document_properties(fileData)
+                            except Exception:
+                                custom_doc_properties = {}
+
+                        # Best-effort recovery of customXml/itemN.xml parts
+                        # (see vba_emulator/custom_xml_extractor.py) -- a
+                        # real technique where a macro's payload is stashed
+                        # as a Custom XML Part instead of the macro source
+                        # or a document property, read back via
+                        # ActiveDocument.CustomXMLParts(uri).SelectSingleNode(...).Text.
+                        if extract_custom_xml_parts is not None:
+                            try:
+                                custom_xml_parts = extract_custom_xml_parts(fileData)
+                            except Exception:
+                                custom_xml_parts = {}
+
+                        # Recover stored worksheet values used by Excel VBA
+                        # payloads such as `Sheets("Sheet 1").Range("B9")`
+                        # followed by Offset() through a base64 blob. These
+                        # values live in worksheet/sharedStrings XML, not in
+                        # vbaProject.bin, so macro extraction alone cannot
+                        # expose them to the interpreter.
+                        if extract_excel_cell_values is not None:
+                            try:
+                                excel_cells = extract_excel_cell_values(fileData)
+                            except Exception:
+                                excel_cells = {}
+
+                        # Best-effort recovery of Ribbon customUI callback
+                        # names (see vba_emulator/customui_extractor.py) --
+                        # e.g. `<customUI onLoad="rokky">` -- Word/Excel
+                        # invokes these automatically on ribbon load, the
+                        # same effective auto-exec behavior as
+                        # Document_Open/AutoOpen under a macro name a scan
+                        # of only the conventional AutoExec names would
+                        # never invoke during emulation.
+                        if extract_customui_callbacks is not None:
+                            try:
+                                customui_callbacks = extract_customui_callbacks(fileData)
+                            except Exception:
+                                customui_callbacks = []
+
+                        # Recover procedures assigned to clickable Excel
+                        # pictures/shapes (`<xdr:pic macro="...">` and
+                        # `<xdr:sp macro="...">`). They are user-action
+                        # callbacks rather than automatic open events, but an
+                        # analysis sandbox should explore them just like a
+                        # clicked lure button; otherwise these workbooks have
+                        # no callable entry point and misleadingly report zero
+                        # behavior.
+                        if extract_shape_macro_callbacks is not None:
+                            try:
+                                shape_callbacks = extract_shape_macro_callbacks(fileData)
+                            except Exception:
+                                shape_callbacks = []
+
+                        for mac in all_vba_macros:
                             # oletools typically returns: (container, stream_path, vba_filename, vba_code)
                             try:
                                 container = mac[0] if len(mac) > 0 else ""
@@ -591,6 +946,9 @@ class DocumentAnalyzer:
                                 )
                                 if truncated:
                                     report["macros"]["truncated"]["vba"] += 1
+
+                                if vba_code and vba_code.strip():
+                                    modules_for_emulation.append((vba_filename, vba_code))
                             except Exception:
                                 code, truncated = self._sanitize_and_truncate(mac, max_macro_chars)
                                 report["macros"]["vba"].append({"code": code, "truncated": truncated})
@@ -612,6 +970,40 @@ class DocumentAnalyzer:
                                 report["macros"]["truncated"]["xlm"] += 1
                             print(mac)
                     print(f"\n{infoS} Extraction completed.")
+
+                    # Sandboxed behavior emulation, run automatically *once* over
+                    # every extracted module concatenated together rather
+                    # than once per module -- after extraction/display is
+                    # fully done and announced above, since this is a
+                    # distinct (and comparatively slow) subsequent phase,
+                    # not part of "extraction" itself. A real VBA project is
+                    # one shared global namespace -- a Sub in one module can
+                    # call a Public Sub in another directly, or
+                    # module-qualified (e.g. a Document_Close handler doing
+                    # `Module1.Checker` to reach a dropper Sub stashed in a
+                    # separate module, a real pattern seen in the wild).
+                    # Emulating each module as its own fully isolated
+                    # program can never observe that call: the callee
+                    # simply doesn't exist in that run, and the whole
+                    # cross-module payload silently never executes. Uses
+                    # the *full*, untruncated vba_code for every module --
+                    # the report's "code" field above is only
+                    # display-truncated.
+                    if modules_for_emulation:
+                        combined_code = "\n\n".join(code for _, code in modules_for_emulation)
+                        module_names = [os.path.splitext(fname)[0] for fname, _ in modules_for_emulation if fname]
+                        emu_origin = "VBA project: " + ", ".join(module_names) if module_names else "VBA project"
+                        emu_result = self._run_emulation(combined_code, emu_origin,
+                                                          activex_controls=activex_controls,
+                                                          module_names=module_names,
+                                                          custom_doc_properties=custom_doc_properties,
+                                                          custom_xml_parts=custom_xml_parts,
+                                                          extra_entry_points=sorted(
+                                                              set(customui_callbacks + shape_callbacks),
+                                                              key=str.lower),
+                                                          excel_cells=excel_cells)
+                        if emu_result is not None:
+                            report["emulation"]["macros"].append(emu_result)
                 else:
                     print(f"{infoS} Automatic macro extraction disabled by env [bold green]SC0PE_DOC_AUTO_EXTRACT_MACROS=0[white].")
 
@@ -1176,17 +1568,66 @@ class DocumentAnalyzer:
         print(f"{infoS} Parsing contents of the target document...")
         self.Structure()
 
+    def _decode_script_bytes(self, script_bytes):
+        # Plain `.decode("utf-8", errors="ignore")` silently mangles any
+        # UTF-16 .vbs file (common -- many Windows script editors/droppers
+        # save .vbs as UTF-16LE) into mostly-empty text: every ASCII byte
+        # is followed by a null byte, and "ignore" just drops most of it.
+        # That broke both the pre-existing static pattern analysis (every
+        # category showed 0 hits despite YARA matching real UTF-16-encoded
+        # "CreateObject" bytes in the same file) and, later, emulation
+        # (0 steps / empty program) -- found while wiring up emulation.
+        if script_bytes[:2] == b"\xff\xfe":
+            return script_bytes[2:].decode("utf-16-le", errors="ignore")
+        if script_bytes[:2] == b"\xfe\xff":
+            return script_bytes[2:].decode("utf-16-be", errors="ignore")
+        if script_bytes[:3] == b"\xef\xbb\xbf":
+            return script_bytes[3:].decode("utf-8", errors="ignore")
+        # No BOM: a text file that's actually UTF-16 without one still has
+        # a very high proportion of null bytes (one per ASCII character).
+        # Plain UTF-8/ASCII source essentially never does.
+        if script_bytes and (script_bytes.count(b"\x00") / len(script_bytes)) > 0.25:
+            try:
+                return script_bytes.decode("utf-16-le")
+            except UnicodeDecodeError:
+                pass
+        try:
+            return script_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return script_bytes.decode("latin-1", errors="ignore")
+
     def VBScriptAnalysis(self):
-        print(f"{infoS} Performing VBScript/VBA static analysis...")
         try:
             with open(self.targetFile, "rb") as fptr:
                 script_bytes = fptr.read()
         except Exception as exc:
             err_exit(f"{errorS} Could not read target script. Details: {exc}")
 
-        script_text = script_bytes.decode("utf-8", errors="ignore")
+        script_text = self._decode_script_bytes(script_bytes)
         if script_text.strip() == "":
             script_text = allstr
+
+        if looks_like_applescript(script_text):
+            report["document_type"] = "applescript"
+            report["script_analysis"]["language"] = "AppleScript"
+            self._add_finding("AppleScript", "use_analyze_instead_of_docs")
+            target = _esc(self._sanitize_text(self.targetFile))
+            print(f"{errorS} AppleScript analysis is not supported by [bold green]--docs[white]. "
+                  f"Use [bold green]--analyze[white] instead:\n"
+                  f"    [bold cyan]python3 qu1cksc0pe.py --file \"{target}\" --analyze[white]")
+            return
+
+        if looks_like_batch_script(script_text):
+            report["document_type"] = "batch_script"
+            report["script_analysis"]["language"] = "Windows Batch"
+            self._add_finding("Batch", "use_analyze_instead_of_docs")
+            target = _esc(self._sanitize_text(self.targetFile))
+            print(f"{errorS} Batch script analysis is not supported by [bold green]--docs[white]. "
+                  f"Use [bold green]--analyze[white] instead:\n"
+                  f"    [bold cyan]python3 qu1cksc0pe.py --file \"{target}\" --analyze[white]")
+            return
+
+        print(f"{infoS} Performing VBScript/VBA static analysis...")
 
         lower_file = self.targetFile.lower()
         if lower_file.endswith(".vbs") or lower_file.endswith(".vbe"):
@@ -1201,6 +1642,13 @@ class DocumentAnalyzer:
             report["script_analysis"]["vbe_encoded"] = True
             self._add_finding("VBScript", "vbe_encoded_marker")
             print(f"{infoS} Encoded VBE marker detected ([bold yellow]#@~^[white]).")
+        else:
+            # Automatic sandboxed behavior emulation. MS Script Encoder
+            # (.vbe) obfuscated files are skipped -- decoding that cipher
+            # is not implemented, so there's no plaintext to emulate.
+            emu_result = self._run_emulation(script_text, os.path.basename(self.targetFile))
+            if emu_result is not None:
+                report["emulation"]["script"] = emu_result
 
         vb_patterns = {
             "AutoExec": [
@@ -1335,6 +1783,10 @@ class DocumentAnalyzer:
             script_text
         )
         for candidate in b64_candidates[:60]:
+            # Hex hashes are also syntactically valid base64. Decoding them
+            # as UTF-16 produces printable but meaningless glyphs.
+            if re.fullmatch(r"[0-9A-Fa-f]+", candidate) and len(candidate) % 2 == 0:
+                continue
             decoded = None
             for encoding in ("utf-16-le", "utf-8", "latin-1"):
                 try:
@@ -1343,7 +1795,9 @@ class DocumentAnalyzer:
                     text = text.strip()
                     if len(text) < 8:
                         continue
-                    printable_ratio = sum(ch.isprintable() for ch in text) / max(len(text), 1)
+                    printable_ratio = sum(
+                        ch in "\r\n\t" or 32 <= ord(ch) <= 126 for ch in text
+                    ) / max(len(text), 1)
                     if printable_ratio < 0.65:
                         continue
                     decoded = text

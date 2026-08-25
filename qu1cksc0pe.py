@@ -316,6 +316,29 @@ def BasicAnalyzer(analyzeFile):
     print(f"{infoS} Analyzing: [bold green]{analyzeFile}[white]")
     fileType = str(pr.magic_file(analyzeFile))
     lower_ext = os.path.splitext(analyzeFile)[1].lower()
+    is_applescript = False
+    is_batch_script = False
+    is_html_script = False
+    if lower_ext in (".vbs", ".vbe", ".vba", ".vb", ".bas", ".cls", ".frm", ".applescript"):
+        try:
+            from Modules.apple_analyzer import is_applescript_file
+            is_applescript = is_applescript_file(analyzeFile)
+        except Exception:
+            is_applescript = False
+        try:
+            from Modules.batch_analyzer import is_batch_file
+            is_batch_script = is_batch_file(analyzeFile)
+        except Exception:
+            is_batch_script = False
+        try:
+            with open(analyzeFile, "rb") as source_file:
+                source_head = source_file.read(65536).decode("utf-8", errors="ignore").lstrip().lower()
+            is_html_script = (
+                source_head.startswith(("<!doctype", "<html", "<script", "<!--"))
+                and ("<script" in source_head or "<html" in source_head)
+            )
+        except (OSError, UnicodeError):
+            is_html_script = False
     # Windows Analysis
     if "Windows Executable" in fileType or ".msi" in fileType or ".dll" in fileType or ".exe" in fileType:
         print(f"{infoS} Target OS: [bold green]Windows[white]\n")
@@ -339,6 +362,35 @@ def BasicAnalyzer(analyzeFile):
             execute_module(f"apple_analyzer.py \"{analyzeFile}\" True")
         else:
             execute_module(f"apple_analyzer.py \"{analyzeFile}\" False")
+        _maybe_run_ai()
+
+    # AppleScript source (content-based: malware often uses .vba/.txt).
+    elif is_applescript:
+        print(f"{infoS} Target OS: [bold green]OSX[white]")
+        print(f"{infoS} Performing [bold green]AppleScript[white] analysis...\n")
+        if args.report:
+            execute_module(f"apple_analyzer.py \"{analyzeFile}\" True")
+        else:
+            execute_module(f"apple_analyzer.py \"{analyzeFile}\" False")
+        _maybe_run_ai()
+
+    # Windows batch source disguised with a VBA/VBScript extension.
+    elif is_batch_script:
+        print(f"{infoS} Target OS: [bold green]Windows[white]")
+        print(f"{infoS} Performing [bold green]Batch Script[white] analysis...\n")
+        if args.report:
+            execute_module(f"batch_analyzer.py \"{analyzeFile}\" True")
+        else:
+            execute_module(f"batch_analyzer.py \"{analyzeFile}\" False")
+        _maybe_run_ai()
+
+    # HTML/VBScript source disguised with a VBA/VBScript extension.
+    elif is_html_script:
+        print(f"{infoS} Performing [bold green]HTML[white] analysis...\n")
+        if args.report:
+            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" True")
+        else:
+            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" False")
         _maybe_run_ai()
 
     # Android Analysis

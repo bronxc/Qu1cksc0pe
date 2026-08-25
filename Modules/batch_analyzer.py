@@ -9,11 +9,17 @@ from collections import OrderedDict
 try:
     # Module execution (python -m Modules.batch_analyzer)
     from .utils.helpers import err_exit, get_argv, save_report
-    from .analysis.multiple.multi import yara_rule_scanner
 except ImportError:
     # Raw execution (python Modules/batch_analyzer.py)
     from utils.helpers import err_exit, get_argv, save_report
-    from analysis.multiple.multi import yara_rule_scanner
+
+try:
+    from .analysis.multiple.multi import yara_rule_scanner
+except (ImportError, ModuleNotFoundError):
+    try:
+        from analysis.multiple.multi import yara_rule_scanner
+    except (ImportError, ModuleNotFoundError):
+        yara_rule_scanner = None
 
 try:
     from rich import print
@@ -23,8 +29,6 @@ except Exception:
 
 
 TARGET_FILE = str(get_argv(1, "")).strip()
-if not TARGET_FILE:
-    err_exit("[bold white on red]Target file not found!\n")
 EMIT_REPORT = str(get_argv(2, "False")).strip().lower() == "true"
 
 infoS = f"[bold cyan][[bold red]*[bold cyan]][white]"
@@ -86,10 +90,57 @@ CATEGORY_PATTERNS = OrderedDict(
 
 
 def _safe_decode(data):
+    if data[:2] == b"\xff\xfe":
+        return data[2:].decode("utf-16-le", errors="ignore")
+    if data[:2] == b"\xfe\xff":
+        return data[2:].decode("utf-16-be", errors="ignore")
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", errors="ignore")
     try:
         return data.decode("utf-8")
     except Exception:
         return data.decode("latin-1", errors="ignore")
+
+
+_BATCH_LINE_RE = re.compile(
+    r"^\s*@?(?:echo(?:\s+(?:off|on))?\b|setlocal\b|endlocal\b|start\b|"
+    # `Call` is deliberately excluded: it is also a very common VBA/VBS
+    # statement, and obfuscated scripts may contain hundreds of Call lines.
+    r"goto\b|if\s+(?:not\s+)?exist\b|for\s+(?:/\w+\s+)?%|"
+    r"cmd(?:\.exe)?\b|powershell(?:\.exe)?\b|curl\b|wget\b|certutil\b|"
+    r"bitsadmin\b|reg\s+(?:add|delete)\b|schtasks\b|del\b|erase\b|"
+    r"copy\b|move\b|mkdir\b|md\b|rmdir\b|rd\b|exit\s+/b\b|:[\w.-]+)",
+    re.IGNORECASE,
+)
+_VBA_LINE_RE = re.compile(
+    r"^\s*(?:Attribute\s+VB_|(?:Private\s+|Public\s+)?(?:Sub|Function)\b|"
+    r"End\s+(?:Sub|Function|If)\b|Dim\s+\w+|Set\s+\w+\s*=)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_batch_script(source):
+    """Content-based batch detection for misleading script extensions."""
+    text = str(source or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    first = lines[0].lower()
+    if first in ("@echo off", "@echo on", "echo off", "echo on"):
+        return True
+
+    batch_hits = sum(1 for line in lines[:2000] if _BATCH_LINE_RE.match(line))
+    vba_hits = sum(1 for line in lines[:2000] if _VBA_LINE_RE.match(line))
+    return batch_hits >= 3 and batch_hits > (vba_hits * 2)
+
+
+def is_batch_file(path):
+    try:
+        with open(path, "rb") as source_file:
+            return looks_like_batch_script(_safe_decode(source_file.read()))
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _calc_hashes(path):
@@ -184,6 +235,8 @@ def _scan_categories(lines):
 
 def _scan_yara(target_file):
     rep = {"matched_rules": []}
+    if yara_rule_scanner is None:
+        return []
     try:
         hit = yara_rule_scanner(
             "/Systems/Windows/YaraRules_Windows/",

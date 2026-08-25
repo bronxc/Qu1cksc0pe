@@ -6,6 +6,7 @@ import yara
 import os
 from rich import print
 from rich.table import Table
+from rich.markup import escape
 
 # Compatibility
 path_seperator = "/"
@@ -71,6 +72,7 @@ def perform_strings(filename):
 # YARA RULE CACHE (rule_dir -> list[(rule_file, yara.Rules)])
 _YARA_RULE_CACHE = {}
 _YARA_RULE_CACHE_ERR = {}
+_YARA_MATCH_TIMEOUT_SECONDS = 2
 
 def _resolve_rule_dir(rulepath):
     cleaned = str(rulepath or "").strip().strip('"').strip("'")
@@ -139,13 +141,16 @@ def yara_rule_scanner(
     Optional args:
       quiet_nomatch: suppress per-file "no match" message
       header_label: printed before matches (useful to label targets)
-      quiet_errors: suppress rule-load errors
+      quiet_errors: suppress rule-load errors. Match timeouts are always
+                    reported because silently skipping a rule can create a
+                    false-negative impression.
       detailed_key: report key for detailed per-target matches (default: None)
 
     Returns True if any rule matched; False otherwise.
     """
     yara_match_indicator = 0
     report_object.setdefault("matched_rules", [])
+    report_object.setdefault("yara_scan_warnings", [])
     if detailed_key:
         report_object.setdefault(detailed_key, [])
 
@@ -164,15 +169,43 @@ def yara_rule_scanner(
 
     # This array for holding and parsing easily matched rules
     yara_matches = []
-    for _, rules in compiled_rules:
+    timed_out_rule_files = []
+    for rule_file, rules in compiled_rules:
         try:
-            tempmatch = rules.match(filename)
+            # A single pathological regex-heavy rule used to hold the whole
+            # document scan for minutes on multi-megabyte script samples.
+            # YARA enforces this deadline internally, so it also interrupts
+            # native matching work that a Python-side timer cannot preempt.
+            tempmatch = rules.match(filename, timeout=_YARA_MATCH_TIMEOUT_SECONDS)
+        except yara.TimeoutError:
+            warning = {
+                "type": "match_timeout",
+                "target": str(filename),
+                "rule_file": str(rule_file),
+                "timeout_seconds": _YARA_MATCH_TIMEOUT_SECONDS,
+            }
+            if warning not in report_object["yara_scan_warnings"]:
+                report_object["yara_scan_warnings"].append(warning)
+            timed_out_rule_files.append(str(rule_file))
+            continue
         except Exception:
             continue
         if tempmatch:
             for matched in tempmatch:
                 if matched.strings:
                     yara_matches.append(matched)
+
+    if timed_out_rule_files:
+        shown = ", ".join(escape(name) for name in timed_out_rule_files[:5])
+        remaining = len(timed_out_rule_files) - 5
+        if remaining > 0:
+            shown += f", ... (+{remaining} more)"
+        print(
+            f"[bold yellow]YARA scan warning:[white] "
+            f"{len(timed_out_rule_files)} rule file(s) exceeded the "
+            f"{_YARA_MATCH_TIMEOUT_SECONDS}s match limit while scanning "
+            f"[bold cyan]{escape(str(filename))}[white]: {shown}"
+        )
 
     # Printing area
     if yara_matches != []:
