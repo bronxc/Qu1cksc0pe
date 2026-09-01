@@ -122,7 +122,8 @@ class PowerShellAnalyzer:
         try:
             # Prefer the strings output (already collected). Keep it simple and ASCII-safe.
             data = "\n".join([s for s in (self.all_strings or []) if isinstance(s, str)])
-            with open("temp.txt", "w", encoding="utf-8", errors="ignore") as f:
+            temp_txt_path = os.environ.get("SC0PE_TEMP_TXT_PATH", "temp.txt")
+            with open(temp_txt_path, "w", encoding="utf-8", errors="ignore") as f:
                 f.write(data)
         except Exception:
             # Best-effort only.

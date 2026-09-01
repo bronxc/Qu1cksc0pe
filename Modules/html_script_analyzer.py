@@ -12,8 +12,17 @@ from bs4 import BeautifulSoup
 from analysis.multiple.multi import chk_wlist, perform_strings, yara_rule_scanner, calc_hashes
 from utils.helpers import err_exit, get_argv, save_report
 
+# Native JavaScript behavior emulator.  It abstractly interprets common
+# browser/WSH/Node malware APIs and never executes the sample in a JS runtime.
+# Keep this optional so static analysis remains available in partial installs.
+try:
+    from js_emulator import emulate_javascript
+except Exception:
+    emulate_javascript = None
+
 try:
     from rich import print
+    from rich.markup import escape as _esc
     from rich.table import Table
 except:
     err_exit("Error: >rich< module not found.")
@@ -28,6 +37,10 @@ infoS = f"[bold cyan][[bold red]*[bold cyan]][white]"
 errorS = f"[bold cyan][[bold red]![bold cyan]][white]"
 URL_REGEX = r"https?://[^\s'\"<>()]+"
 URL_PATTERN = re.compile(URL_REGEX)
+# Matches js_emulator.MAX_SOURCE_CHARS (20M chars): UTF-16 samples need
+# 2 bytes/char, so this must be at least 2x that to avoid truncating the
+# raw read before the decoder even sees the tail of a large UTF-16 sample.
+MAX_SCRIPT_FILE_BYTES = 48 * 1024 * 1024
 
 # Target file
 targetFile = sys.argv[1]
@@ -91,6 +104,10 @@ report = {
             "target_file": "",
             "exit_code": None
         }
+    },
+    "emulation": {
+        "enabled": False,
+        "javascript": []
     }
 }
 
@@ -123,10 +140,7 @@ class HTMLScriptAnalyzer:
         report["sections"][key] = value
 
     def _sanitize_text(self, value):
-        sanitized = ""
-        for ch in str(value):
-            sanitized += ch if ch.isprintable() else f"\\x{ord(ch):02x}"
-        return sanitized
+        return "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in str(value))
 
     def _sanitize_and_truncate(self, value, max_chars):
         sanitized = self._sanitize_text(value)
@@ -168,10 +182,213 @@ class HTMLScriptAnalyzer:
         return any(symbol in text for symbol in symbol_chars)
 
     def output_writer(self, out_file, mode, buffer):
-        with open(out_file, mode) as ff:
-            ff.write(buffer)
-        print(f"{infoS} Data saved as: [bold yellow]{out_file}[white]")
-        self._append_unique("extracted_files", out_file)
+        # Carved names are derived from attacker-controlled content lengths.
+        # Use exclusive creation so an existing file or symlink is never
+        # followed or silently overwritten.
+        requested = os.path.basename(str(out_file))
+        stem, suffix = os.path.splitext(requested)
+        actual = requested
+        fd = None
+        for index in range(1000):
+            if index:
+                actual = f"{stem}-{index}{suffix}"
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                fd = os.open(actual, flags, 0o600)
+                break
+            except FileExistsError:
+                continue
+        if fd is None:
+            raise OSError(f"Could not allocate a unique output name for {requested}")
+        if "b" in mode:
+            with os.fdopen(fd, "wb") as ff:
+                ff.write(buffer)
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="ignore") as ff:
+                ff.write(buffer)
+        print(f"{infoS} Data saved as: [bold yellow]{_esc(actual)}[white]")
+        self._append_unique("extracted_files", actual)
+        return actual
+
+    def _read_target_bytes(self):
+        try:
+            with open(self.targetFile, "rb") as source_file:
+                data = source_file.read(MAX_SCRIPT_FILE_BYTES + 1)
+        except OSError:
+            return b""
+        if len(data) > MAX_SCRIPT_FILE_BYTES:
+            try:
+                original_size = os.path.getsize(self.targetFile)
+            except OSError:
+                original_size = len(data)
+            report["sections"]["script_input_truncated"] = {
+                "limit_bytes": MAX_SCRIPT_FILE_BYTES,
+                "original_size_bytes": original_size,
+            }
+            return data[:MAX_SCRIPT_FILE_BYTES]
+        return data
+
+    def _decode_script_bytes(self, script_bytes):
+        # Plain `.decode("utf-8", errors="ignore")` silently mangles any
+        # UTF-16 .js/.hta file (common -- many WSH droppers are saved as
+        # UTF-16LE) into mostly-empty text: every ASCII byte is followed by
+        # a null byte, and "ignore" just drops most of it. That breaks both
+        # the static pattern analysis (every category shows 0 hits despite
+        # YARA matching the same UTF-16-encoded strings) and emulation
+        # (0 steps / empty program). Mirrors document_analyzer.py's fix for
+        # the same issue in .vbs files.
+        if script_bytes[:2] == b"\xff\xfe":
+            return script_bytes[2:].decode("utf-16-le", errors="ignore")
+        if script_bytes[:2] == b"\xfe\xff":
+            return script_bytes[2:].decode("utf-16-be", errors="ignore")
+        if script_bytes[:3] == b"\xef\xbb\xbf":
+            return script_bytes[3:].decode("utf-8", errors="ignore")
+        # No BOM: a text file that's actually UTF-16 without one still has
+        # a very high proportion of null bytes (one per ASCII character).
+        # Plain UTF-8/ASCII source essentially never does.
+        if script_bytes and (script_bytes.count(b"\x00") / len(script_bytes)) > 0.25:
+            try:
+                return script_bytes.decode("utf-16-le")
+            except UnicodeDecodeError:
+                pass
+        try:
+            return script_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return script_bytes.decode("latin-1", errors="ignore")
+
+    def _read_target_text(self):
+        return self._decode_script_bytes(self._read_target_bytes())
+
+    # ── Sandboxed JavaScript behavior emulation ─────────────────────────────
+
+    def _run_javascript_emulation(self, source, origin):
+        if emulate_javascript is None or not source or not source.strip():
+            return None
+
+        # js_emulator._bounded_timeout() already permits up to 30s; large,
+        # deliberately padded samples (junk-character-stuffed source well
+        # past the old 8M-char cap) can need close to that just to reach
+        # their first network/process call, so use the full budget.
+        timeout_seconds = 30
+        print(f"\n{infoS} Emulating [bold green]{_esc(self._sanitize_text(origin))}[white] "
+              f"(isolated, in-memory, up to {timeout_seconds}s)...")
+        try:
+            result = emulate_javascript(source, origin=origin, timeout_seconds=timeout_seconds)
+        except Exception as exc:
+            print(f"{errorS} JavaScript emulation failed: {_esc(str(exc))}")
+            return None
+
+        report["emulation"]["enabled"] = True
+        report["emulation"]["javascript"].append(result)
+        for finding in result.get("findings", []):
+            self._add_finding("JavaScript Emulation", finding.get("rule_id", "finding"))
+        for request in result.get("network_requests", []):
+            normalized = self._normalize_url(str(request.get("url", "")))
+            if normalized and chk_wlist(normalized):
+                self._append_unique("extracted_urls", normalized)
+
+        try:
+            self._display_javascript_emulation(result)
+        except Exception as exc:
+            print(f"{errorS} JavaScript emulation completed but rendering failed: {_esc(str(exc))}")
+        return result
+
+    def _display_javascript_emulation(self, result):
+        print(f"[dim]>>> Emulation finished ({result.get('elapsed_seconds', 0)}s, "
+              f"{result.get('step_count', 0):,} steps, engine: "
+              f"{_esc(result.get('engine', 'unknown'))})[white]")
+        for finding in result.get("findings", []):
+            severity = finding.get("severity", "info").upper()
+            color = {
+                "HIGH": "bold red", "MEDIUM": "bold yellow", "LOW": "bold blue",
+                "INFO": "white",
+            }.get(severity, "white")
+            print(f"  [{color}][{severity}][white] {_esc(finding.get('title', ''))}")
+
+        events = result.get("ioc_events", [])
+        print(f"\n[bold cyan]JavaScript behavior trace[white]  ({len(events)} events)")
+        if not events:
+            print("  [dim](no behavior observed through a modeled JavaScript API)[white]")
+        else:
+            display_limit = 250
+            for index, event in enumerate(events[:display_limit], 1):
+                category = event.get("category", "event")
+                details = []
+                for key, value in event.items():
+                    if key in ("category", "ts") or value in (None, ""):
+                        continue
+                    safe_value, _truncated = self._sanitize_and_truncate(value, 1024)
+                    details.append(f"{key}={safe_value}")
+                detail_text, _detail_truncated = self._sanitize_and_truncate(", ".join(details), 4096)
+                detail_text = _esc(detail_text)
+                print(f"  [dim]{index:>4} t+{event.get('ts', 0):6.3f}s[white] "
+                      f"[bold magenta]{_esc(category):<20}[white] {detail_text}")
+            if len(events) > display_limit:
+                print(f"  [dim]... {len(events) - display_limit} additional events are available in the JSON report.[white]")
+
+        network_events = [
+            event for event in events
+            if event.get("category") in (
+                "network_request", "network_send", "network_download_capability",
+                "network_c2_capability", "network_indicator"
+            )
+        ]
+        print("\n[bold cyan]Network activity[white]")
+        if not network_events:
+            incomplete_payloads = [
+                event for event in events
+                if event.get("category") == "embedded_payload_truncated"
+            ]
+            if incomplete_payloads:
+                print("  [bold yellow]unresolved[white] exact downstream network activity could not be "
+                      "recovered because an embedded executable is incomplete")
+                for event in incomplete_payloads:
+                    print(f"  [dim]payload_sha256={_esc(event.get('payload_sha256', 'unknown'))}, "
+                          f"recovered_size={_esc(event.get('recovered_size', 'unknown'))}, "
+                          f"declared_size={_esc(event.get('declared_size', 'unknown'))}[white]")
+            else:
+                print("  [dim]none observed at the JavaScript/embedded-payload layer[white]")
+        else:
+            for event in network_events:
+                details = []
+                for key, value in event.items():
+                    if key in ("category", "ts") or value in (None, ""):
+                        continue
+                    safe_value, _truncated = self._sanitize_and_truncate(value, 1024)
+                    details.append(f"{key}={safe_value}")
+                print(f"  [bold yellow]{_esc(event.get('category', 'network'))}[white] "
+                      f"{_esc(', '.join(details))}")
+
+    def _emulate_inline_javascript(self, html_text, origin_label):
+        if not html_text.strip():
+            return None
+        soup = BeautifulSoup(html_text, "html.parser")
+        blocks = []
+        for tag in soup.find_all("script"):
+            language = str(tag.get("language") or tag.get("type") or "").lower()
+            if "vbscript" in language or tag.get("src"):
+                continue
+            body = tag.string if tag.string is not None else tag.get_text()
+            if body and body.strip():
+                blocks.append(body)
+
+        # Browser malware frequently hides the only executable statements in
+        # onload/onclick attributes or javascript: URLs rather than <script>.
+        for tag in soup.find_all(True):
+            for attribute, value in tag.attrs.items():
+                if isinstance(value, list):
+                    value = " ".join(str(item) for item in value)
+                value = str(value)
+                if str(attribute).lower().startswith("on") and value.strip():
+                    blocks.append(value)
+                elif value.lower().startswith("javascript:"):
+                    blocks.append(value[len("javascript:"):])
+
+        if not blocks:
+            return None
+        combined = "\n;\n".join(blocks)
+        self._register_section("inline_javascript_blocks", len(blocks))
+        return self._run_javascript_emulation(combined, origin_label)
 
     # ── Shared analysis helpers ───────────────────────────────────────────────
 
@@ -368,7 +585,7 @@ class HTMLScriptAnalyzer:
             return "javascript"
         if lower_file.endswith(".hta"):
             return "hta"
-        if "HTML document" in decoded_doc_type:
+        if lower_file.endswith((".html", ".htm")) or "HTML document" in decoded_doc_type:
             return "html"
         return "unknown"
 
@@ -377,6 +594,7 @@ class HTMLScriptAnalyzer:
     def HTMLanalysis(self):
         print(f"{infoS} Performing HTML analysis...")
         soup_analysis = BeautifulSoup(allstr, "html.parser")
+        raw_html = self._read_target_text() or allstr
 
         # Check for malicious code patterns
         self.html_detect_malicious_code(given_buffer=allstr)
@@ -386,6 +604,10 @@ class HTMLScriptAnalyzer:
 
         # Dump javascript
         self.html_dump_javascript(soup_obj=soup_analysis)
+
+        # Execute no attacker code: inline blocks and event handlers are
+        # abstractly interpreted against fake browser/WSH/Node APIs.
+        self._emulate_inline_javascript(raw_html, f"{os.path.basename(self.targetFile)}:inline-js")
 
         # Check for input points
         self.html_check_input_points(soup_obj=soup_analysis)
@@ -430,13 +652,11 @@ class HTMLScriptAnalyzer:
 
     def JSAnalysis(self):
         print(f"{infoS} Performing JavaScript static analysis...")
-        try:
-            with open(self.targetFile, "rb") as fptr:
-                script_bytes = fptr.read()
-        except Exception as exc:
-            err_exit(f"{errorS} Could not read target script. Details: {exc}")
+        script_bytes = self._read_target_bytes()
+        if not script_bytes and not os.path.isfile(self.targetFile):
+            err_exit(f"{errorS} Could not read target script.")
 
-        script_text = script_bytes.decode("utf-8", errors="ignore")
+        script_text = self._decode_script_bytes(script_bytes)
         if script_text.strip() == "":
             script_text = allstr
 
@@ -553,19 +773,21 @@ class HTMLScriptAnalyzer:
         else:
             print(f"{errorS} There is no URL value found!")
 
+        # Automatic, side-effect-free behavior emulation runs in addition to
+        # the complete static scan above.
+        self._run_javascript_emulation(script_text, os.path.basename(self.targetFile))
+
         # Perform Yara scan
         print(f"\n{infoS} Performing YARA rule matching...")
         yara_rule_scanner(self.rule_path, self.targetFile, report)
 
     def HTAAnalysis(self):
         print(f"{infoS} Performing HTA (HTML Application) analysis...")
-        try:
-            with open(self.targetFile, "rb") as fptr:
-                hta_bytes = fptr.read()
-        except Exception as exc:
-            err_exit(f"{errorS} Could not read target file. Details: {exc}")
+        hta_bytes = self._read_target_bytes()
+        if not hta_bytes and not os.path.isfile(self.targetFile):
+            err_exit(f"{errorS} Could not read target file.")
 
-        hta_text = hta_bytes.decode("utf-8", errors="ignore")
+        hta_text = self._decode_script_bytes(hta_bytes)
         soup = BeautifulSoup(hta_text, "html.parser")
 
         # HTA application metadata
@@ -664,6 +886,12 @@ class HTMLScriptAnalyzer:
                     script_table.add_row(category, "0")
                 report["script_analysis"]["categories"][category] = hits
             print(script_table)
+
+        if script_lang != "VBScript" and combined_scripts.strip():
+            self._run_javascript_emulation(
+                combined_scripts,
+                f"{os.path.basename(self.targetFile)}:inline-js",
+            )
 
         # Base64 decode hints from full HTA text
         decoded_hints = []

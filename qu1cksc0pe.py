@@ -9,6 +9,7 @@ try:
     import getpass
     import configparser
     import shutil
+    import tempfile
     import warnings
 except Exception as e:
     print(f"Missing modules detected!: {e}")
@@ -104,29 +105,28 @@ else:
 from Modules.utils.helpers import err_exit
 
 MODULE_PREFIX = f"{sc0pe_path}{path_seperator}Modules{path_seperator}"
-def execute_module(target, path=MODULE_PREFIX, invoker=py_binary):
-    if "python" in invoker or ".py" in target:
+def execute_module(module, *module_args, path=MODULE_PREFIX, invoker=None, env=None):
+    """Execute a bundled module without passing arguments through a shell.
+
+    File names are attacker-controlled input for an analysis tool.  Keeping
+    every argument as a distinct argv element prevents command substitution,
+    metacharacters and embedded quotes in a sample name from becoming shell
+    syntax.
+    """
+    if invoker is None:
+        invoker_args = [py_binary]
+    elif isinstance(invoker, (str, os.PathLike)):
+        invoker_args = [os.fspath(invoker)]
+    else:
+        invoker_args = [os.fspath(item) for item in invoker]
+    if any("python" in str(item).lower() for item in invoker_args) or str(module).endswith(".py"):
         # TODO in the future, raise a ValueError/OSError (and remove the additional code below)
         # instead of warning with a PendingDeprecationWarning
         DEV_NOTE = "[DEV NOTE]: when switching to import statements, remember to adjust any downstream imports! (e.g. `from .utils import err_exit` vs `from utils import err_exit`)"
         warnings.warn("Direct execution of Python files won't be supported much longer." + f" {DEV_NOTE}", PendingDeprecationWarning)
-    parts  = target.split(" ", 1)
-    script = parts[0]
-    extra  = f" {parts[1]}" if len(parts) > 1 else ""
-    inner_command = f'"{invoker}" "{path}{script}"{extra}'
-    if sys.platform == "win32":
-        # cmd.exe's `/c` only preserves quoting cleanly when the command string
-        # contains exactly two quote characters; with more (invoker path quoted
-        # *and* script path quoted, as below) it falls back to stripping just the
-        # first and last quote, mangling everything in between. Wrapping the
-        # whole command in one more outer quote pair is the standard workaround.
-        # POSIX shells don't share this quirk -- an extra outer quote pair there
-        # flips the quote-toggle parity for every char after it, turning the
-        # separator spaces between args into literal quoted spaces and merging
-        # the whole command into a single unresolvable word.
-        os.system(f'"{inner_command}"')
-    else:
-        os.system(inner_command)
+    module_path = os.path.join(path, str(module))
+    command = [*invoker_args, module_path, *(str(arg) for arg in module_args)]
+    return subprocess.run(command, check=False, env=env)
 
 # Only the *stdio* MCP transport talks JSON-RPC over this process's own
 # stdout, so only that mode requires suppressing the startup banner. Other
@@ -213,7 +213,7 @@ def _maybe_run_ai(fast_mode=False):
         print(f"{errorS} AI analysis requested but no report file found (expected sc0pe_*_report.json).")
         return
     if not fast_mode:
-        execute_module(f"analysis/multiple/smart_analyzer.py \"{report_path}\"")
+        execute_module("analysis/multiple/smart_analyzer.py", report_path)
         return
 
     smart_analyzer_path = os.path.join(sc0pe_path, "Modules", "analysis", "multiple", "smart_analyzer.py")
@@ -232,7 +232,7 @@ def _maybe_run_ai(fast_mode=False):
     try:
         subprocess.run([sys.executable, smart_analyzer_path, report_path], env=env, check=False)
     except Exception:
-        execute_module(f"analysis/multiple/smart_analyzer.py \"{report_path}\"")
+        execute_module("analysis/multiple/smart_analyzer.py", report_path)
 
 def launch_web_ui():
     web_app_path = os.path.join(sc0pe_path, "Modules", "web_app.py")
@@ -263,7 +263,7 @@ def _save_api_key(prompt_label, filename):
         return
 
     if not os.path.exists(f"{homeD}{path_seperator}sc0pe_Base"):
-        os.system(f"mkdir {homeD}{path_seperator}sc0pe_Base")
+        os.makedirs(os.path.join(homeD, "sc0pe_Base"), exist_ok=True)
 
     apifile = open(f"{homeD}{path_seperator}sc0pe_Base{path_seperator}{filename}", "w")
     apifile.write(apikey)
@@ -311,11 +311,40 @@ def launch_mcp_server():
             arg_override=mcp_proc.returncode,
         )
 
+# Extensions routed purely by their extension further down in this function.
+# puremagic's deep-scan heuristics (notably a CSV-delimiter sniff over the
+# whole decoded text via csv.Sniffer) can take minutes on a large minified or
+# obfuscated script with very long, comma/colon-dense lines -- content these
+# formats commonly have.  The fast magic-byte header/footer match (still
+# always enabled) is all that's actually needed here: it already catches a
+# binary renamed with one of these extensions, and routing for genuine
+# scripts/text below never inspects the deep-scan-only fields anyway.
+_DEEPSCAN_SKIP_EXTENSIONS = {
+    ".js", ".ps1", ".hta", ".bat", ".cmd", ".lnk", ".applescript",
+    ".vbs", ".vbe", ".vba", ".vb", ".bas", ".cls", ".frm",
+    ".html", ".htm",
+}
+
+
+def _magic_file_fast(analyzeFile, lower_ext):
+    if lower_ext not in _DEEPSCAN_SKIP_EXTENSIONS:
+        return str(pr.magic_file(analyzeFile))
+    previous = os.environ.get("PUREMAGIC_DEEPSCAN")
+    os.environ["PUREMAGIC_DEEPSCAN"] = "0"
+    try:
+        return str(pr.magic_file(analyzeFile))
+    finally:
+        if previous is None:
+            os.environ.pop("PUREMAGIC_DEEPSCAN", None)
+        else:
+            os.environ["PUREMAGIC_DEEPSCAN"] = previous
+
+
 # Basic analyzer function that handles single and multiple scans
 def BasicAnalyzer(analyzeFile):
     print(f"{infoS} Analyzing: [bold green]{analyzeFile}[white]")
-    fileType = str(pr.magic_file(analyzeFile))
     lower_ext = os.path.splitext(analyzeFile)[1].lower()
+    fileType = _magic_file_fast(analyzeFile, lower_ext)
     is_applescript = False
     is_batch_script = False
     is_html_script = False
@@ -343,9 +372,9 @@ def BasicAnalyzer(analyzeFile):
     if "Windows Executable" in fileType or ".msi" in fileType or ".dll" in fileType or ".exe" in fileType:
         print(f"{infoS} Target OS: [bold green]Windows[white]\n")
         if args.report:
-            execute_module(f"windows_static_analyzer.py \"{analyzeFile}\" True True")
+            execute_module("windows_static_analyzer.py", analyzeFile, "True", "True")
         else:
-            execute_module(f"windows_static_analyzer.py \"{analyzeFile}\" False True")
+            execute_module("windows_static_analyzer.py", analyzeFile, "False", "True")
         _maybe_run_ai()
 
     # Linux Analysis
@@ -359,9 +388,9 @@ def BasicAnalyzer(analyzeFile):
     elif "Mach-O" in fileType or '\\xca\\xfe\\xba\\xbe' in fileType:
         print(f"{infoS} Target OS: [bold green]OSX[white]\n")
         if args.report:
-            execute_module(f"apple_analyzer.py \"{analyzeFile}\" True")
+            execute_module("apple_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"apple_analyzer.py \"{analyzeFile}\" False")
+            execute_module("apple_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # AppleScript source (content-based: malware often uses .vba/.txt).
@@ -369,9 +398,9 @@ def BasicAnalyzer(analyzeFile):
         print(f"{infoS} Target OS: [bold green]OSX[white]")
         print(f"{infoS} Performing [bold green]AppleScript[white] analysis...\n")
         if args.report:
-            execute_module(f"apple_analyzer.py \"{analyzeFile}\" True")
+            execute_module("apple_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"apple_analyzer.py \"{analyzeFile}\" False")
+            execute_module("apple_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Windows batch source disguised with a VBA/VBScript extension.
@@ -379,18 +408,18 @@ def BasicAnalyzer(analyzeFile):
         print(f"{infoS} Target OS: [bold green]Windows[white]")
         print(f"{infoS} Performing [bold green]Batch Script[white] analysis...\n")
         if args.report:
-            execute_module(f"batch_analyzer.py \"{analyzeFile}\" True")
+            execute_module("batch_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"batch_analyzer.py \"{analyzeFile}\" False")
+            execute_module("batch_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # HTML/VBScript source disguised with a VBA/VBScript extension.
     elif is_html_script:
         print(f"{infoS} Performing [bold green]HTML[white] analysis...\n")
         if args.report:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" True")
+            execute_module("html_script_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" False")
+            execute_module("html_script_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Android Analysis
@@ -403,107 +432,107 @@ def BasicAnalyzer(analyzeFile):
         # If given file is a JAR file then run JAR file analysis
         if file_name_trim[-1] == ".jar": # Extension based detection
             if args.report:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" True JAR")
+                execute_module("apkAnalyzer.py", analyzeFile, "True", "JAR")
             else:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" False JAR")
+                execute_module("apkAnalyzer.py", analyzeFile, "False", "JAR")
             _maybe_run_ai()
         elif "Dalvik (Android) executable" in fileType:
             if args.report:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" True DEX")
+                execute_module("apkAnalyzer.py", analyzeFile, "True", "DEX")
             else:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" False DEX")
+                execute_module("apkAnalyzer.py", analyzeFile, "False", "DEX")
             _maybe_run_ai()
         else:
             if args.report:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" True APK")
+                execute_module("apkAnalyzer.py", analyzeFile, "True", "APK")
             else:
-                execute_module(f"apkAnalyzer.py \"{analyzeFile}\" False APK")
+                execute_module("apkAnalyzer.py", analyzeFile, "False", "APK")
             _maybe_run_ai()
             if not args.report:
                 # APP Security
                 choice = str(input(f"\n{infoC} Do you want to check target app\'s security? This process will take a while.[Y/n]: "))
                 if choice == "Y" or choice == "y":
-                    execute_module(f"apkSecCheck.py")
+                    execute_module("apkSecCheck.py")
 
     # Pcap analysis
     elif "pcap" in fileType or "capture file" in fileType or lower_ext in (".pcap", ".pcapng"):
         print(f"{infoS} Performing [bold green]PCAP[white] analysis...\n")
         if args.report:
-            execute_module(f"pcap_analyzer.py \"{analyzeFile}\" True")
+            execute_module("pcap_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"pcap_analyzer.py \"{analyzeFile}\" False")
+            execute_module("pcap_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Powershell analysis
     elif ".ps1" in analyzeFile:
         print(f"{infoS} Performing [bold green]Powershell Script[white] analysis...\n")
         if args.report:
-            execute_module(f"powershell_analyzer.py \"{analyzeFile}\" True")
+            execute_module("powershell_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"powershell_analyzer.py \"{analyzeFile}\" False")
+            execute_module("powershell_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # VBScript/VBA family analysis
     elif lower_ext in (".vbs", ".vbe", ".vba", ".vb", ".bas", ".cls", ".frm"):
         print(f"{infoS} Performing [bold green]VBScript/VBA[white] analysis...\n")
         if args.report:
-            execute_module(f"document_analyzer.py \"{analyzeFile}\" True")
+            execute_module("document_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"document_analyzer.py \"{analyzeFile}\" False")
+            execute_module("document_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # HTML analysis
     elif lower_ext in (".html", ".htm"):
         print(f"{infoS} Performing [bold green]HTML[white] analysis...\n")
         if args.report:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" True")
+            execute_module("html_script_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" False")
+            execute_module("html_script_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # JavaScript analysis
     elif lower_ext == ".js":
         print(f"{infoS} Performing [bold green]JavaScript[white] analysis...\n")
         if args.report:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" True")
+            execute_module("html_script_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" False")
+            execute_module("html_script_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # HTA (HTML Application) analysis
     elif lower_ext == ".hta":
         print(f"{infoS} Performing [bold green]HTA[white] analysis...\n")
         if args.report:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" True")
+            execute_module("html_script_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"html_script_analyzer.py \"{analyzeFile}\" False")
+            execute_module("html_script_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Windows Batch Script analysis
     elif lower_ext in (".bat", ".cmd"):
         print(f"{infoS} Performing [bold green]Batch Script[white] analysis...\n")
         if args.report:
-            execute_module(f"batch_analyzer.py \"{analyzeFile}\" True")
+            execute_module("batch_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"batch_analyzer.py \"{analyzeFile}\" False")
+            execute_module("batch_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Windows Shortcut (LNK) analysis
     elif lower_ext == ".lnk":
         print(f"{infoS} Performing [bold green]Windows Shortcut (LNK)[white] analysis...\n")
         if args.report:
-            execute_module(f"lnk_analyzer.py \"{analyzeFile}\" True")
+            execute_module("lnk_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"lnk_analyzer.py \"{analyzeFile}\" False")
+            execute_module("lnk_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
 
     # Email file analysis
     elif "email message" in fileType or "message/rfc822" in fileType:
         print(f"{infoS} Performing [bold green]Email File[white] analysis...\n")
         if args.report:
-            execute_module(f"email_analyzer.py \"{analyzeFile}\" True")
+            execute_module("email_analyzer.py", analyzeFile, "True")
         else:
-            execute_module(f"email_analyzer.py \"{analyzeFile}\" False")
+            execute_module("email_analyzer.py", analyzeFile, "False")
         _maybe_run_ai()
     else:
         err_exit("\n[bold white on red]File type not supported. Make sure you are analyze executable files or document files.\n[bold]>>> If you want to scan document files try [bold green][i]--docs[/i] [white]argument.")
@@ -541,16 +570,16 @@ def Qu1cksc0pe():
                     # Because why not!
                     print(f"{infoS} Analyzing: [bold green]{args.file}[white]")
                     if args.report:
-                        execute_module(f"archiveAnalyzer.py \"{args.file}\" True")
+                        execute_module("archiveAnalyzer.py", args.file, "True")
                     else:
-                        execute_module(f"archiveAnalyzer.py \"{args.file}\" False")
+                        execute_module("archiveAnalyzer.py", args.file, "False")
                     _maybe_run_ai(fast_mode=True)
                     sys.exit(0)
 
                 # Check for embedded executables by default!
                 if not args.sigcheck:
                     print(f"{infoS} Executing [bold green]SignatureAnalyzer[white] module...")
-                    execute_module(f"sigChecker.py \"{args.file}\"")
+                    execute_module("sigChecker.py", args.file)
                     sys.exit(0)
         else:
             err_exit("[bold white on red]Target file not found!\n")
@@ -570,9 +599,9 @@ def Qu1cksc0pe():
         if args.file is not None:
             print(f"{infoS} Analyzing: [bold green]{args.file}[white]")
             if args.report:
-                execute_module(f"archiveAnalyzer.py \"{args.file}\" True")
+                execute_module("archiveAnalyzer.py", args.file, "True")
             else:
-                execute_module(f"archiveAnalyzer.py \"{args.file}\" False")
+                execute_module("archiveAnalyzer.py", args.file, "False")
             _maybe_run_ai(fast_mode=True)
         # Handling --folder argument
         if args.folder is not None:
@@ -584,9 +613,9 @@ def Qu1cksc0pe():
         if args.file is not None:
             print(f"{infoS} Analyzing: [bold green]{args.file}[white]")
             if args.report:
-                execute_module(f"document_analyzer.py \"{args.file}\" True")
+                execute_module("document_analyzer.py", args.file, "True")
             else:
-                execute_module(f"document_analyzer.py \"{args.file}\" False")
+                execute_module("document_analyzer.py", args.file, "False")
             _maybe_run_ai()
         # Handling --folder argument
         if args.folder is not None:
@@ -596,16 +625,16 @@ def Qu1cksc0pe():
     if args.hashscan:
         # Handling --file argument
         if args.file is not None:
-            execute_module(f"hashScanner.py \"{args.file}\" --normal")
+            execute_module("hashScanner.py", args.file, "--normal")
         # Handling --folder argument
         if args.folder is not None:
-            execute_module(f"hashScanner.py {args.folder} --multiscan")
+            execute_module("hashScanner.py", args.folder, "--multiscan")
 
     # File signature scanner
     if args.sigcheck:
         # Handling --file argument
         if args.file is not None:
-            execute_module(f"sigChecker.py \"{args.file}\"")
+            execute_module("sigChecker.py", args.file)
         # Handling --folder argument
         if args.folder is not None:
             err_exit("[bold white on red][blink]--sigcheck[/blink] argument is not supported for folder analyzing!\n")
@@ -614,7 +643,7 @@ def Qu1cksc0pe():
     if args.resource:
         # Handling --file argument
         if args.file is not None:
-            execute_module(f"resourceChecker.py \"{args.file}\"")
+            execute_module("resourceChecker.py", args.file)
         # Handling --folder argument
         if args.folder is not None:
             err_exit("[bold white on red][blink]--resource[/blink] argument is not supported for folder analyzing!\n")
@@ -624,9 +653,9 @@ def Qu1cksc0pe():
         # Handling --file argument
         if args.file is not None:
             if args.report:
-                execute_module(f"languageDetect.py \"{args.file}\" True {str(bool(args.ai))}")
+                execute_module("languageDetect.py", args.file, "True", str(bool(args.ai)))
             else:
-                execute_module(f"languageDetect.py \"{args.file}\" False {str(bool(args.ai))}")
+                execute_module("languageDetect.py", args.file, "False", str(bool(args.ai)))
         # Handling --folder argument
         if args.folder is not None:
             err_exit("[bold white on red][blink]--lang[/blink] argument is not supported for folder analyzing!\n")
@@ -645,7 +674,7 @@ def Qu1cksc0pe():
             if apik[0] == '' or apik[0] is None or len(apik[0]) != 64:
                 err_exit("[bold]Please get your API key from -> [bold green][a]https://www.virustotal.com/[/a]\n")
             else:
-                execute_module(f"VTwrapper.py {apik[0]} \"{args.file}\"")
+                execute_module("VTwrapper.py", apik[0], args.file)
         # Handling --folder argument
         if args.folder is not None:
             err_exit("[bold white on red]If you want to get banned from VirusTotal then do that :).\n")
@@ -655,35 +684,35 @@ def Qu1cksc0pe():
         # Handling --file argument
         if args.file is not None:
             if args.report:
-                execute_module(f"packerAnalyzer.py --single \"{args.file}\" True {str(bool(args.ai))}")
+                execute_module("packerAnalyzer.py", "--single", args.file, "True", str(bool(args.ai)))
             else:
-                execute_module(f"packerAnalyzer.py --single \"{args.file}\" False {str(bool(args.ai))}")
+                execute_module("packerAnalyzer.py", "--single", args.file, "False", str(bool(args.ai)))
         # Handling --folder argument
         if args.folder is not None:
             if args.report:
-                execute_module(f"packerAnalyzer.py --multiscan {args.folder} True {str(bool(args.ai))}")
+                execute_module("packerAnalyzer.py", "--multiscan", args.folder, "True", str(bool(args.ai)))
             else:
-                execute_module(f"packerAnalyzer.py --multiscan {args.folder} False {str(bool(args.ai))}")
+                execute_module("packerAnalyzer.py", "--multiscan", args.folder, "False", str(bool(args.ai)))
 
     # domain extraction
     if args.domain:
         # Handling --file argument
         if args.file is not None:
             if args.report:
-                execute_module(f"domainCatcher.py \"{args.file}\" True")
+                execute_module("domainCatcher.py", args.file, "True")
             else:
-                execute_module(f"domainCatcher.py \"{args.file}\" False")
+                execute_module("domainCatcher.py", args.file, "False")
         # Handling --folder argument
         if args.folder is not None:
             err_exit("[bold white on red][blink]--domain[/blink] argument is not supported for folder analyzing!\n")
 
     # Dynamic analysis
     if args.watch:
-        execute_module(f"emulator.py")
+        execute_module("emulator.py")
 
     # Database update
     if args.db_update:
-        execute_module(f"hashScanner.py --db_update")
+        execute_module("hashScanner.py", "--db_update")
 
     # Managing VirusTotal / AI provider API keys
     if args.key_init:
@@ -698,19 +727,41 @@ def Qu1cksc0pe():
         if sys.platform == "win32":
             err_exit(f"{errorS} This feature is not suitable for Windows systems for now!")
 
-        execute_module(f'installer.sh "{sc0pe_path}" "{username}"', invoker="sudo bash")
+        execute_module("installer.sh", sc0pe_path, username, invoker=["sudo", "bash"])
+
+_owned_strings_file = None
+
+
+def _prepare_strings_file():
+    """Give each CLI invocation a private strings file shared by its children."""
+    global _owned_strings_file
+    fd, path = tempfile.mkstemp(prefix="qu1cksc0pe-strings-", suffix=".txt")
+    os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    _owned_strings_file = path
+    os.environ["SC0PE_TEMP_TXT_PATH"] = path
+
 
 def cleanup_junks():
-    junkFiles = ["temp.txt", ".target-file.txt", ".target-folder.txt", "TargetAPK/", "TargetSource/"]
+    junkFiles = [".target-file.txt", ".target-folder.txt", "TargetAPK/", "TargetSource/"]
     for junk in junkFiles:
         if os.path.exists(junk):
             try: # assume simple file
                 os.unlink(junk)
             except OSError: # try this for directories
                 shutil.rmtree(junk)
+    if _owned_strings_file and os.path.isfile(_owned_strings_file):
+        try:
+            os.unlink(_owned_strings_file)
+        except OSError:
+            pass
 
 def main():
     try:
+        _prepare_strings_file()
         Qu1cksc0pe()
     except KeyboardInterrupt:
         print("\n[bold white on red]Program terminated by user.\n")

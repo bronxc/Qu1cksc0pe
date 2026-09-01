@@ -354,6 +354,13 @@ def analyze_file(
     Emulation runs in addition to normal static analysis with a fixed 15s
     per-script/project safety budget, so raise timeout_seconds for large or
     heavily obfuscated inputs when necessary.
+
+    JavaScript and inline JScript in HTML/HTA files are also emulated
+    automatically by a bounded native abstract interpreter. It models fake
+    browser, WSH/ActiveX and Node.js APIs entirely in memory; attacker source,
+    commands, filesystem operations and network requests are never executed.
+    The document report's emulation.javascript list contains findings, an IOC
+    trace, decoded eval layers, network/process attempts and virtual writes.
     """
     _log_call("analyze_file", file_path=file_path, ai=ai, ai_provider=ai_provider,
                timeout_seconds=timeout_seconds)

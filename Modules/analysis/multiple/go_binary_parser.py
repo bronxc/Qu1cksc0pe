@@ -58,7 +58,8 @@ class GolangParser:
         for k in CATEGORIES:
             CATEGORIES[k] = []
         try:
-            self._all_patterns = open("temp.txt", "r", encoding="utf-8", errors="ignore").read().split("\n")
+            strings_path = os.environ.get("SC0PE_TEMP_TXT_PATH", "temp.txt")
+            self._all_patterns = open(strings_path, "r", encoding="utf-8", errors="ignore").read().split("\n")
         except Exception:
             self._all_patterns = []
         self._section_buffer = None

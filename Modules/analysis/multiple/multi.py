@@ -4,6 +4,10 @@ import hashlib
 import subprocess
 import yara
 import os
+import atexit
+import stat
+import tempfile
+import threading
 from rich import print
 from rich.table import Table
 from rich.markup import escape
@@ -11,6 +15,9 @@ from rich.markup import escape
 # Compatibility
 path_seperator = "/"
 strings_param = "-a"
+_MAX_STRINGS_OUTPUT_BYTES = 16 * 1024 * 1024
+_STRINGS_TIMEOUT_SECONDS = 60
+_owned_strings_path = None
 if sys.platform == "win32":
     path_seperator = "\\"
 
@@ -61,13 +68,127 @@ def calc_hashes(filename, report_object):
     report_object["hash_sha1"] = hashsha1.hexdigest()
     report_object["hash_sha256"] = hashsha256.hexdigest()
 
+def _cleanup_owned_strings_file():
+    if _owned_strings_path:
+        try:
+            os.unlink(_owned_strings_path)
+        except OSError:
+            pass
+
+
+def _strings_output_path():
+    """Return a private per-analysis path shared through the environment."""
+    global _owned_strings_path
+    configured = os.environ.get("SC0PE_TEMP_TXT_PATH", "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    fd, output_path = tempfile.mkstemp(prefix="qu1cksc0pe-strings-", suffix=".txt")
+    os.close(fd)
+    try:
+        os.chmod(output_path, 0o600)
+    except OSError:
+        pass
+    _owned_strings_path = output_path
+    os.environ["SC0PE_TEMP_TXT_PATH"] = output_path
+    return output_path
+
+
+def _secure_strings_file(output_path):
+    """Open the strings output without following a pre-existing symlink."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(output_path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("strings output path is not a regular file")
+    try:
+        os.chmod(output_path, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, "w+b")
+
+
+def _run_strings_bounded(command, output_file, remaining_bytes):
+    """Stream a strings process into the output without exceeding its cap."""
+    if remaining_bytes <= 0:
+        return True
+    try:
+        process = subprocess.Popen(
+            command,
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+
+    state = {"written": 0, "capped": False}
+
+    def pump_stdout():
+        try:
+            while process.stdout is not None:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                allowed = min(len(chunk), remaining_bytes - state["written"])
+                if allowed > 0:
+                    output_file.write(chunk[:allowed])
+                    state["written"] += allowed
+                if state["written"] >= remaining_bytes:
+                    state["capped"] = True
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                    break
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+    reader = threading.Thread(target=pump_stdout, name="qu1cksc0pe-strings-reader", daemon=True)
+    reader.start()
+    try:
+        process.wait(timeout=_STRINGS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    reader.join(timeout=5)
+    if reader.is_alive():
+        try:
+            process.kill()
+        except OSError:
+            pass
+        reader.join(timeout=1)
+    return state["capped"]
+
+
 # PERFORM STRINGS
 def perform_strings(filename):
-    subprocess.run(f"strings {strings_param} \"{filename}\" > temp.txt", stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE, shell=True)
+    """Extract bounded strings without invoking a command shell."""
+    output_path = _strings_output_path()
+    commands = [["strings", strings_param, str(filename)]]
     if sys.platform != "win32":
-        subprocess.run(f"strings {strings_param} -e l {filename} >> temp.txt", stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE, shell=True)
-    allstrs = open("temp.txt", "r").read().split("\n")
-    return allstrs
+        commands.append(["strings", strings_param, "-e", "l", str(filename)])
+
+    try:
+        with _secure_strings_file(output_path) as output_file:
+            for command in commands:
+                remaining = _MAX_STRINGS_OUTPUT_BYTES - output_file.tell()
+                capped = _run_strings_bounded(command, output_file, remaining)
+                output_file.flush()
+                if capped or output_file.tell() >= _MAX_STRINGS_OUTPUT_BYTES:
+                    output_file.truncate(_MAX_STRINGS_OUTPUT_BYTES)
+                    break
+            output_file.flush()
+            output_file.seek(0)
+            raw = output_file.read(_MAX_STRINGS_OUTPUT_BYTES)
+    except OSError:
+        return []
+    return raw.decode("utf-8", errors="ignore").split("\n")
+
+
+atexit.register(_cleanup_owned_strings_file)
 
 # YARA RULE CACHE (rule_dir -> list[(rule_file, yara.Rules)])
 _YARA_RULE_CACHE = {}

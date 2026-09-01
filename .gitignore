@@ -76,6 +76,7 @@ sc0pe_process-*.json
 qu1cksc0pe_memory_dump_*.bin
 qu1cksc0pe_carved*
 qu1cksc0pe_decrypted_*
+qu1cksc0pe_decoded_*
 carved.bmp
 temp.txt
 .target-file.txt
