@@ -464,7 +464,7 @@ def BasicAnalyzer(analyzeFile):
         _maybe_run_ai()
 
     # Powershell analysis
-    elif ".ps1" in analyzeFile:
+    elif lower_ext == ".ps1":
         print(f"{infoS} Performing [bold green]Powershell Script[white] analysis...\n")
         if args.report:
             execute_module("powershell_analyzer.py", analyzeFile, "True")
