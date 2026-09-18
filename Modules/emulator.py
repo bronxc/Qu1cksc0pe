@@ -3,8 +3,9 @@
 import os
 import sys
 import shutil
+import subprocess
 
-from utils.helpers import err_exit
+from utils.helpers import err_exit, run_interactive_monitor
 
 try:
     from rich import print
@@ -58,12 +59,10 @@ class DynamicAnalyzer:
             tos = int(input("\n>>> Select: "))
             if tos == 1:
                 print(f"\n{infoS} Target OS: [bold green]Android")
-                command = f'{py_binary} "{sc0pe_path}{path_seperator}Modules{path_seperator}android_dynamic_analyzer.py"'
-                os.system(command)
+                run_interactive_monitor([py_binary, os.path.join(sc0pe_path, "Modules", "android_dynamic_analyzer.py")])
             elif tos == 2:
                 print(f"\n{infoS} Target OS: [bold green]Linux")
-                command = f'{py_binary} "{sc0pe_path}{path_seperator}Modules{path_seperator}linux_dynamic_analyzer.py"'
-                os.system(command)
+                run_interactive_monitor([py_binary, os.path.join(sc0pe_path, "Modules", "linux_dynamic_analyzer.py")])
             else:
                 err_exit(f"{errorS} Wrong option :(")
 
@@ -75,13 +74,10 @@ class DynamicAnalyzer:
             tos = int(input("\n>>> Select: "))
             if tos == 1:
                 print(f"\n{infoS} Target OS: [bold green]Android")
-                target_file = prompt("[>>>] Enter Full Path of The Target File [Press TAB to auto-complete]: ", completer=path_completer)
-                command = f'{py_binary} "{sc0pe_path}{path_seperator}Modules{path_seperator}android_dynamic_analyzer.py" "{target_file}"'
-                os.system(command)
+                run_interactive_monitor([py_binary, os.path.join(sc0pe_path, "Modules", "android_dynamic_analyzer.py")])
             elif tos == 2:
                 print(f"\n{infoS} Target OS: [bold green]Windows")
-                command = f'{py_binary} "{sc0pe_path}{path_seperator}Modules{path_seperator}windows_dynamic_analyzer.py"'
-                os.system(command)
+                run_interactive_monitor([py_binary, os.path.join(sc0pe_path, "Modules", "windows_dynamic_analyzer.py")])
             else:
                 err_exit(f"{errorS} Wrong option :(")
         else:

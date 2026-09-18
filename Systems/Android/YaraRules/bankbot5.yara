@@ -1,5 +1,5 @@
 import "androguard"
-rule : BankBot
+rule BankBot
 {
 	meta:
 		description = "This rule detects the bankbot app based on various info"
@@ -23,7 +23,7 @@ rule : BankBot
 		$c2_4 = "activity_inj" nocase
 	condition:
 		2 of ($c2_*) or
-		$a and androguard.permission(/android.permission.CALL_PHONE/) 
+		($a and (androguard.permission(/android.permission.CALL_PHONE/)
 		or androguard.permission(/android.permission.READ_CONTACTS/)
-		or androguard.permission(/android.permission.READ_PHONE_STATE/)		
+		or androguard.permission(/android.permission.READ_PHONE_STATE/)))
 }

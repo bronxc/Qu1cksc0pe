@@ -1,255 +1,165 @@
-#!/usr/bin/python3
-
-import os
-import re
-import sys
-import json
+#!/usr/bin/env python3
+"""Evidence-based Android family candidates from the current APK workspace."""
+import argparse
 import hashlib
+import json
+import os
+from pathlib import Path
+import re
 
-# FIX: Import recursive_dir_scan from helpers instead of duplicating it.
-from utils.helpers import err_exit, recursive_dir_scan
-
-try:
-    from rich import print
-except ImportError:
-    err_exit("Error: >rich< module not found.")
-
-try:
-    import pyaxmlparser
-except ImportError:
-    err_exit("Error: >pyaxmlparser< module not found.")
-
-# Disabling pyaxmlparser's logs
-pyaxmlparser.core.logging.disable()
-
-# Legends
-errorS = f"[bold cyan][[bold red]![bold cyan]][white]"
-infoS = f"[bold cyan][[bold red]*[bold cyan]][white]"
-
-# Compatibility
-path_seperator = "/"
-if sys.platform == "win32":
-    path_seperator = "\\"
-
-# Gathering Qu1cksc0pe path variable
-with open(os.path.join(os.path.expanduser("~"), ".qu1cksc0pe_path"), "r") as _ph:
-    sc0pe_path = _ph.read().strip()
-
-targetApk = sys.argv[1]
-
-# Gathering data
-with open(f"{sc0pe_path}{path_seperator}Systems{path_seperator}Android{path_seperator}family.json") as _fam:
-    fam_data = json.load(_fam)
-
-# Minimum number of SourcePattern hits required to award a score point,
-# reducing false positives from patterns that may appear in benign code.
-_SOURCE_SCAN_MIN_HITS = 2
 
 class AndroidFamilyDetect:
-    def __init__(self):
-        self.scoreDict = {
-            "Hydra": 0,
-            "FluBot": 0,
-            "MoqHao": 0,
-            "SharkBot": 0,
-            "SpyNote/SpyMax": 0,
-            "Sova": 0,
-            "Cerberus": 0,
-            "Anubis": 0,
-            "EventBot": 0,
-        }
-        try:
-            self.checktarg = pyaxmlparser.APK(targetApk)
-            self.content = self.checktarg.get_activities()
-            self.content += self.checktarg.get_services()
-            self.content += self.checktarg.get_receivers()
-        except Exception:
-            self.checktarg = None
-            self.content = None
+    MAX_FILE_BYTES = 4 * 1024 * 1024
+    MAX_TOTAL_BYTES = 64 * 1024 * 1024
+    MAX_FILES = 10000
+    GENERIC_INDICATORS = {
+        'overlayservice', 'myadminreceiver', 'accessibilityactivity', 'adminactivity',
+        'headlesssmssendservice', 'appaccessibilityservice', 'workerservice',
+        'encryptorservice', 'smsreceiver', 'mmsreceiver', 'xiaomiloadactivity', 'nointernet',
+    }
 
-    # Function for computing hashes
-    def GetSHA256(self, file_name):
-        hash_256 = hashlib.sha256()
-        with open(file_name, "rb") as ff:
-            for chunk in iter(lambda: ff.read(4096), b""):
-                hash_256.update(chunk)
-        return str(hash_256.hexdigest())
+    def __init__(self, target_apk, *, source_dir=None, apk=None, patterns=None):
+        self.target = str(target_apk)
+        self.source_dir = Path(source_dir).resolve() if source_dir else None
+        self.apk = apk
+        self.patterns = patterns if patterns is not None else json.loads(
+            (Path(__file__).resolve().parents[1] / 'Systems/Android/family.json').read_text())
+        self.report = {'status': 'ok', 'candidates': [], 'observations': [], 'errors': [],
+                       'source_coverage': {'files': 0, 'bytes': 0, 'skipped': 0},
+                       'malware_verdict': None,
+                       'method': 'At least two distinct indicators including a non-generic indicator. Class-name dot/case variants count once; generic components alone do not identify a family.'}
+        self.evidence = {name: {} for name in self.patterns}
 
-    # Function for detecting: Hydra MoqHao SharkBot families
-    def HyMoqShark(self):
-        for key in fam_data:
+    def _record(self, family, pattern, kind, location):
+        key = pattern.casefold()
+        if re.fullmatch(r'\.?[A-Za-z_$][\w$]*', pattern):
+            key = key.lstrip('.')
+        bucket = self.evidence.setdefault(family, {})
+        item = bucket.setdefault(key, {'indicator': pattern, 'kinds': [], 'locations': [],
+                                       'generic': key in self.GENERIC_INDICATORS})
+        if kind not in item['kinds']:
+            item['kinds'].append(kind)
+        if location not in item['locations'] and len(item['locations']) < 5:
+            item['locations'].append(location)
+
+    def _manifest(self):
+        if self.apk is None:
             try:
-                for act_key in fam_data[key]:
-                    if act_key == "SourcePatterns":
-                        continue
-                    for dat in fam_data[key][act_key]:
-                        actreg = re.findall(dat, str(self.content))
-                        if actreg:
-                            self.scoreDict[key] += 1
-            except Exception:
-                continue
-
-    # Helper function for parsing: FluBot family
-    def ParseFlu(self, arrayz):
-        counter = 0
-        for el in arrayz:
-            if el[0:2] == ".p" and len(el) == 10:
-                counter += 1
-        return counter
-
-    # Function for detecting: FluBot family
-    def FluBot(self):
-        # Cache API results to avoid calling each getter twice
-        activities = self.checktarg.get_activities()
-        services = self.checktarg.get_services()
-        receivers = self.checktarg.get_receivers()
-
-        act = re.findall(r".p[a-z0-9]{0,9}", str(activities))
-        if self.ParseFlu(act) != 0 and self.ParseFlu(act) == len(activities):
-            self.scoreDict["FluBot"] += 1
-
-        ser = re.findall(r".p[a-z0-9]{0,9}", str(services))
-        if self.ParseFlu(ser) != 0 and self.ParseFlu(ser) == len(services):
-            self.scoreDict["FluBot"] += 1
-
-        rec = re.findall(r".p[a-z0-9]{0,9}", str(receivers))
-        if self.ParseFlu(rec) != 0 and self.ParseFlu(rec) == len(receivers):
-            self.scoreDict["FluBot"] += 1
-
-    # Function for detecting: SpyNote family
-    def SpyNote(self):
-        source_files = recursive_dir_scan(target_directory=f"TargetAPK{path_seperator}sources{path_seperator}")
-        source_files += recursive_dir_scan(target_directory=f"TargetAPK{path_seperator}resources{path_seperator}")
-        occur1 = re.findall(r"SensorRestarterBroadcastReceiver", str(source_files))
-        occur2 = re.findall(r"_ask_remove_", str(source_files))
-        occur3 = re.findall(r"SimpleIME", str(source_files))
-        if occur1 or occur2 or occur3:
-            self.scoreDict["SpyNote/SpyMax"] += 1
-
-        # Search for patterns
-        patternz = {
-            "/Config/sys/apps/tch": 0,
-            "App Helper": 0,
-            "SCDir": 0,
-            "/Config/sys/apps/rc": 0,
-            "/exit/chat/": 0,
-            "root@": 0,
-            "spymax.stub": 0
-        }
-        for ff in source_files:
+                from android_archive import validate_apk_size
+                validate_apk_size(self.target)
+                from androguard.core.bytecodes.apk import APK
+                self.apk = APK(self.target)
+            except Exception as error:
+                self.report['errors'].append('APK parsing: ' + str(error))
+                return
+        all_names = []
+        for category, getter in [('Activities', 'get_activities'), ('Services', 'get_services'),
+                                 ('Receivers', 'get_receivers'), ('Providers', 'get_providers')]:
             try:
-                with open(ff, "r") as fh:
-                    file_buffer = fh.read()
-                for pat in patternz:
-                    if re.findall(pat, file_buffer):
-                        patternz[pat] += 1
-            except Exception:
+                names = getattr(self.apk, getter)() or []
+            except Exception as error:
+                self.report['errors'].append(category + ': ' + str(error))
                 continue
+            all_names.extend(names)
+            for family, values in self.patterns.items():
+                for pattern in values.get(category, []):
+                    for name in names:
+                        # The catalog contains class names, not regular expressions.
+                        if name == pattern or name.endswith('.' + pattern.lstrip('.')):
+                            self._record(family, pattern, 'manifest', name)
+        obfuscated = [name for name in all_names if re.search(r'\.p[a-z0-9]{8}$', name)]
+        if len(obfuscated) >= 3:
+            self.report['observations'].append({'type': 'obfuscated_component_names', 'count': len(obfuscated),
+                'detail': 'Naming alone does not identify FluBot or prove malicious behavior.'})
 
-        # Check for occurences
-        occount = sum(1 for v in patternz.values() if v != 0)
-        if occount != 0:
-            self.scoreDict["SpyNote/SpyMax"] += 1
-
-    # Function for detecting families via decompiled source code patterns.
-    # Reads every file under TargetAPK/sources/ once and checks all families'
-    # SourcePatterns in a single pass to keep I/O overhead low.
-    def SourceScan(self):
-        source_files = recursive_dir_scan(target_directory=f"TargetAPK{path_seperator}sources{path_seperator}")
-        if not source_files:
+    def _sources(self):
+        coverage = self.report['source_coverage']
+        if self.source_dir is None or not self.source_dir.is_dir():
+            coverage['status'] = 'unavailable'
             return
-
-        # Collect families that declare SourcePatterns in family.json
-        family_src_patterns = {
-            fam: fam_data[fam]["SourcePatterns"]
-            for fam in fam_data
-            if "SourcePatterns" in fam_data[fam]
-        }
-        if not family_src_patterns:
-            return
-
-        hit_counts = {fam: 0 for fam in family_src_patterns}
-
-        for ff in source_files:
-            try:
-                with open(ff, "r") as fh:
-                    buf = fh.read()
-                for fam, patterns in family_src_patterns.items():
-                    for pat in patterns:
-                        if re.search(re.escape(pat), buf):
-                            hit_counts[fam] += 1
-            except Exception:
+        coverage['status'] = 'ok'
+        patterns = {family: list(dict.fromkeys(data.get('SourcePatterns', []))) for family, data in self.patterns.items()}
+        # Common text such as root@, App Helper or SCDir is not family evidence.
+        spy = ['/Config/sys/apps/tch', '/Config/sys/apps/rc', '/exit/chat/', 'spymax.stub']
+        patterns.setdefault('SpyNote/SpyMax', []).extend(spy)
+        weak = {'root@', 'app helper', 'scdir'}
+        for subtree in ('sources', 'resources'):
+            base = self.source_dir / subtree
+            if base.is_symlink():
+                coverage['skipped'] += 1
                 continue
+            for directory, dirs, files in os.walk(base, followlinks=False):
+                dirs[:] = sorted(d for d in dirs if not (Path(directory) / d).is_symlink())
+                for filename in sorted(files):
+                    path = Path(directory) / filename
+                    if coverage['files'] >= self.MAX_FILES or coverage['bytes'] >= self.MAX_TOTAL_BYTES:
+                        coverage['status'] = 'partial'
+                        coverage['limit_reached'] = True
+                        return
+                    try:
+                        if path.is_symlink() or not path.is_file() or path.stat().st_size > self.MAX_FILE_BYTES:
+                            coverage['skipped'] += 1
+                            continue
+                        remaining = min(self.MAX_FILE_BYTES, self.MAX_TOTAL_BYTES - coverage['bytes'])
+                        with path.open('rb') as source:
+                            data = source.read(remaining + 1)
+                        if len(data) > remaining:
+                            coverage['skipped'] += 1
+                            continue
+                        coverage['files'] += 1
+                        coverage['bytes'] += len(data)
+                        text = data.decode('utf-8', 'replace')
+                        relative = path.relative_to(self.source_dir).as_posix()
+                        for family, values in patterns.items():
+                            for pattern in values:
+                                if pattern.casefold() not in weak and pattern in text:
+                                    self._record(family, pattern, 'source', relative)
+                        if filename in ('SensorRestarterBroadcastReceiver.java', '_ask_remove_.java', 'SimpleIME.java'):
+                            self._record('SpyNote/SpyMax', path.stem, 'filename', relative)
+                        sova = {'nointernet.html': '9d647b7f81404d0744ebd1ead58bf8a6f3b6beb0a98583a907a00b38ff9843c2',
+                                'unique.html': '1b5f986ddee68791fffe37baa4c551feae8016a1b3964ede7e49ec697c3ce26b'}
+                        if filename in sova and hashlib.sha256(data).hexdigest() == sova[filename]:
+                            self._record('Sova', 'sha256:' + sova[filename], 'resource_hash', relative)
+                    except OSError as error:
+                        coverage['skipped'] += 1
+                        if len(self.report['errors']) < 100:
+                            self.report['errors'].append(str(error))
+        if coverage['skipped']:
+            coverage['status'] = 'partial'
 
-        # Award points only when enough distinct patterns matched to be confident.
-        for fam, count in hit_counts.items():
-            if count >= _SOURCE_SCAN_MIN_HITS and fam in self.scoreDict:
-                self.scoreDict[fam] += count
+    def CheckFamily(self, *, quiet=False):
+        self._manifest()
+        self._sources()
+        for family, indicators in self.evidence.items():
+            specific = any(not item['generic'] for item in indicators.values())
+            if len(indicators) >= 2 and specific:
+                self.report['candidates'].append({'family': family, 'distinct_indicators': len(indicators),
+                    'confidence': 'candidate', 'evidence': list(indicators.values())})
+            elif indicators:
+                self.report['observations'].append({'family': family,
+                                                    'type': 'insufficient_family_evidence' if specific else 'generic_component_names',
+                                                    'evidence': list(indicators.values())})
+        self.report['candidates'].sort(key=lambda item: (-item['distinct_indicators'], item['family']))
+        if self.report['errors'] or self.report['source_coverage'].get('status') != 'ok':
+            self.report['status'] = 'partial'
+        if not quiet:
+            from rich.console import Console
+            console = Console()
+            for candidate in self.report['candidates']:
+                console.print(f"Family candidate: {candidate['family']} ({candidate['distinct_indicators']} distinct indicators)", markup=False)
+            if not self.report['candidates']:
+                console.print('No corroborated family candidate in the analyzed content.')
+            if self.report['status'] == 'partial':
+                console.print('Family analysis coverage is partial; see report details.')
+        return self.report
 
-    # Function for detecting: Sova family
-    def Sova(self):
-        # Analyzing resources
-        resource_data = {
-            "nointernet.html": "9d647b7f81404d0744ebd1ead58bf8a6f3b6beb0a98583a907a00b38ff9843c2",
-            "unique.html": "1b5f986ddee68791fffe37baa4c551feae8016a1b3964ede7e49ec697c3ce26b"
-        }
 
-        # Checking for existence
-        ex_count = 0
-        expected = [f"TargetAPK{path_seperator}resources{path_seperator}assets{path_seperator}nointernet.html", f"TargetAPK{path_seperator}resources{path_seperator}assets{path_seperator}unique.html"]
-        for fl in expected:
-            if os.path.exists(fl):
-                target_hash = self.GetSHA256(fl)
-                if target_hash == resource_data[os.path.basename(fl)]:
-                    ex_count += 1
-        if ex_count == 2:
-            self.scoreDict["Sova"] += 1
-
-        # After that we also must checking the activities, services, receivers etc.
-        name_count = 0
-        for act_key in fam_data["Sova"]:
-            if act_key == "SourcePatterns":
-                continue
-            try:
-                for value in fam_data["Sova"][act_key]:
-                    chk = re.findall(value, str(self.content))
-                    if chk:
-                        name_count += 1
-            except Exception:
-                continue
-        if name_count == 11:
-            self.scoreDict["Sova"] += 1
-
-    # Analyzer for malware family detection
-    def CheckFamily(self):
-        # Detect: SpyNote (file-system based, runs regardless of APK parse result)
-        self.SpyNote()
-
-        # Detect families via decompiled source code patterns (also file-system based)
-        self.SourceScan()
-
-        if self.content and self.checktarg:
-            # Detect: Hydra, MoqHao, SharkBot
-            self.HyMoqShark()
-
-            # Detect: FluBot
-            self.FluBot()
-
-            # Detect: Sova
-            self.Sova()
-
-        # Checking statistics
-        sort_score = sorted(self.scoreDict.items(), key=lambda ff: ff[1], reverse=True)
-        if sort_score[0][1] != 0:
-            print(f"\n[bold red]>>>[white] Possible Malware Family: [bold green]{sort_score[0][0]}[white]")
-            # Show top candidates if multiple families scored
-            runners_up = [(f, s) for f, s in sort_score[1:] if s > 0]
-            if runners_up:
-                print(f"{infoS} Other scored families: " + ", ".join(f"[bold yellow]{f}[white]({s})" for f, s in runners_up))
-        else:
-            print(f"{errorS} Couldn\'t detect malware family.")
-
-# Execute
-if os.path.exists("TargetAPK"):
-    afd = AndroidFamilyDetect()
-    afd.CheckFamily()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('apk')
+    parser.add_argument('--source-dir', help='Decompiler output belonging to this APK')
+    parser.add_argument('--json', metavar='PATH')
+    args = parser.parse_args()
+    result = AndroidFamilyDetect(args.apk, source_dir=args.source_dir).CheckFamily()
+    if args.json:
+        Path(args.json).write_text(json.dumps(result, indent=2), encoding='utf-8')

@@ -19,6 +19,11 @@ from datetime import date
 
 from utils.helpers import err_exit
 from analysis.multiple.multi import perform_strings, chk_wlist, yara_rule_scanner as shared_yara_rule_scanner
+from analysis.multiple.android_yara import apk_metadata
+from android_archive import ArchiveBudget, create_workspace, validate_apk_size
+from android_manifest import analyze_apk_manifest
+from android_apk_info import apk_info
+from apkSecCheck import print_security_report
 
 # Module handling
 try:
@@ -68,19 +73,15 @@ strings_param = "-a"
 if sys.platform == "win32":
     path_seperator = "\\"
 
-# Getting target APK
-targetAPK = sys.argv[1]
 
 # Gathering Qu1cksc0pe path variable
-sc0pe_path = open(os.path.join(os.path.expanduser("~"), ".qu1cksc0pe_path"), "r").read().strip()
+sc0pe_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # necessary variables
 danger = 0
 normal = 0
 special = 0
 
-# Gathering all strings from file
-allStrings = perform_strings(targetAPK)
 
 # Parsing date
 today = date.today()
@@ -99,8 +100,14 @@ conf = configparser.ConfigParser()
 conf.read(f"{sc0pe_path}{path_seperator}Systems{path_seperator}Android{path_seperator}libScanner.conf", encoding="utf-8-sig")
 
 class APKAnalyzer:
-    def __init__(self, target_file):
+    def __init__(self, target_file, *, output_dir=None):
         self.target_file = target_file
+        if zipfile.is_zipfile(target_file):
+            validate_apk_size(target_file)
+        self.workspace = create_workspace(output_dir)
+        self.apk_dir = str(self.workspace / "decompiled-apk")
+        self.jar_dir = str(self.workspace / "decompiled-jar")
+        self.archive_budget = ArchiveBudget()
         # Report verbosity control:
         # - default: compact JSON (avoid duplicating heavy fields)
         # - set `SC0PE_ANDROID_REPORT_DETAILED=1` to keep full details
@@ -124,7 +131,8 @@ class APKAnalyzer:
             "findings": []
         }
         self.reportz = {
-            "target_file": "",
+            "target_file": self.full_path_file,
+            "workspace": str(self.workspace),
             "analysis_type": "",
             "app_name": "",
             "package_name": "",
@@ -401,19 +409,8 @@ class APKAnalyzer:
         return out
 
     def _safe_extract_zip_member(self, zf, member_name, dest_dir):
-        # Prevent zip-slip.
-        dest_abs = os.path.abspath(dest_dir)
-        member_name = (member_name or "").lstrip("/").replace("\\", "/")
-        out_path = os.path.abspath(os.path.join(dest_abs, member_name))
-        if not out_path.startswith(dest_abs + os.sep):
-            return None
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        try:
-            with zf.open(member_name, "r") as src, open(out_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        except Exception:
-            return None
-        return out_path
+        info = member_name if isinstance(member_name, zipfile.ZipInfo) else zf.getinfo(member_name)
+        return self.archive_budget.extract(zf, info, dest_dir)
 
     def extract_native_libs_from_apk(self, dest_dir):
         """
@@ -429,12 +426,13 @@ class APKAnalyzer:
                     zlow = zpath.lower()
                     if not zlow.endswith(".so"):
                         continue
-                    out_path = self._safe_extract_zip_member(zf, zpath, dest_dir)
+                    out_path = self._safe_extract_zip_member(zf, info, dest_dir)
                     if not out_path:
                         continue
                     results.append({"path": out_path, "zip_path": zpath, "size": int(getattr(info, "file_size", 0) or 0)})
-        except Exception:
-            return []
+        except Exception as error:
+            self.archive_budget.reject("<archive>", error)
+        self.reportz["archive_extraction"] = self.archive_budget.report()
         return results
 
     def _compile_code_patterns(self):
@@ -550,6 +548,7 @@ class APKAnalyzer:
         return False
 
     def run_decompiler(self, output_dir):
+        self.reportz['decompilation'].update(status='failed', complete=False, exit_code=None)
         self.last_decompile_error = ""
         self.last_decompile_error_detail = ""
         self.last_decompile_warning = ""
@@ -598,13 +597,27 @@ class APKAnalyzer:
                 return False
 
         # jadx 1.5.x removed/changed some flags; avoid using -q for compatibility.
-        proc = subprocess.run(
-            [self.decompiler_path, "-d", output_dir, self.full_path_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        if os.path.exists(output_dir):
+            self.last_decompile_error = "output_directory_already_exists"
+            return False
+        # Keep potentially large tool output on disk, and bound execution time.
+        import tempfile
+        try:
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                proc = subprocess.run(
+                    [self.decompiler_path, "-d", output_dir, self.full_path_file],
+                    stdout=stdout, stderr=stderr, timeout=180,
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                proc.stdout = stdout.read(8192).decode("utf-8", "replace")
+                proc.stderr = stderr.read(8192).decode("utf-8", "replace")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self.last_decompile_error = "decompiler_timeout" if isinstance(error, subprocess.TimeoutExpired) else "decompiler_start_failed"
+            self.last_decompile_error_detail = str(error)
+            return False
         if proc.returncode != 0:
+            self.reportz['decompilation']['exit_code'] = proc.returncode
             # JADX often returns non-zero when some classes failed, but still writes output.
             # If we have usable output, continue and record a warning instead of failing hard.
             usable = _decompile_output_usable(output_dir)
@@ -614,11 +627,12 @@ class APKAnalyzer:
                 print(f"{errorS} Decompiler execution failed.")
             print(f">>> [bold yellow]Exit code:[white] {proc.returncode}")
 
-            first_line = ""
-            if proc.stderr:
-                first_line = proc.stderr.strip().splitlines()[0]
-            elif proc.stdout:
-                first_line = proc.stdout.strip().splitlines()[0]
+            diagnostics = [line.strip() for line in (proc.stderr + '\n' + proc.stdout).splitlines()
+                           if line.strip() and not line.startswith('Picked up JAVA_TOOL_OPTIONS:')]
+            first_line = next((line for line in diagnostics if 'error' in line.lower()),
+                              diagnostics[-1] if diagnostics else '')
+            self.reportz['decompilation'].update(status='partial' if usable else 'failed',
+                                                diagnostics=diagnostics[-20:])
 
             if first_line:
                 print(f">>> [bold yellow]Details:[white] {first_line}")
@@ -631,6 +645,10 @@ class APKAnalyzer:
             self.last_decompile_error = first_line if first_line else f"exit_code_{proc.returncode}"
             self.last_decompile_error_detail = f"exit_code={proc.returncode}"
             return False
+        if not _decompile_output_usable(output_dir):
+            self.last_decompile_error = "no_decompiler_output"
+            return False
+        self.reportz['decompilation'].update(status='complete', complete=True, exit_code=0)
         return True
 
     def get_encrypted_zip_entries(self, file_path):
@@ -647,8 +665,18 @@ class APKAnalyzer:
 
     def report_writer(self, target_os, report_object):
         clean_report = self.prepare_clean_report(report_object)
-        with open(f"sc0pe_{target_os}_report.json", "w") as rp_file:
-            json.dump(clean_report, rp_file, indent=4)
+        import tempfile
+        # Keep a report with each workspace as well as the historical latest-report path.
+        for destination in (str(self.workspace / 'report.json'), f"sc0pe_{target_os}_report.json"):
+            parent = os.path.dirname(os.path.abspath(destination))
+            fd, temporary = tempfile.mkstemp(prefix='.report-', suffix='.json', dir=parent)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as rp_file:
+                    json.dump(clean_report, rp_file, indent=4)
+                os.replace(temporary, destination)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
         print(f"\n[bold magenta]>>>[bold white] Report file saved into: [bold blink yellow]sc0pe_{target_os}_report.json\n")
 
     def prune_empty_values(self, data):
@@ -710,13 +738,31 @@ class APKAnalyzer:
             if finding.get("third_party", False) is False:
                 finding.pop("third_party", None)
 
-        return self.prune_empty_values(clean_report)
+        compact = self.prune_empty_values(clean_report)
+        # Null/false values express unknown/default semantics in these reports.
+        for key in ("manifest_security", "family_detection", "archive_extraction", "apk_member_scan", "decompilation"):
+            if key in clean_report:
+                compact[key] = clean_report[key]
+        return compact
 
     def recursive_dir_scan(self, target_directory):
         fnames = []
-        for root, d_names, f_names in os.walk(target_directory):
-            for ff in f_names:
-                fnames.append(os.path.join(root, ff))
+        coverage = self.reportz.setdefault("source_coverage", {"skipped_files": 0, "status": "ok"})
+        for root, directories, filenames in os.walk(target_directory, followlinks=False):
+            directories[:] = sorted(d for d in directories if not os.path.islink(os.path.join(root, d)))
+            for filename in sorted(filenames):
+                path = os.path.join(root, filename)
+                if len(fnames) >= 10000:
+                    coverage.update(status="partial", file_limit=10000)
+                    return fnames
+                try:
+                    if os.path.islink(path) or os.path.getsize(path) > 4 * 1024 * 1024:
+                        coverage["skipped_files"] += 1
+                        coverage["status"] = "partial"
+                        continue
+                except OSError:
+                    continue
+                fnames.append(path)
         return fnames
 
     def ResourceScan(self, axml_obj):
@@ -742,8 +788,7 @@ class APKAnalyzer:
         self.reportz["resource_scan"] = rs
 
         if not axml_obj:
-            rs["error"] = "manifest_parse_failed"
-            return
+            rs['warnings'] = ['Manifest/type parser unavailable; scanning bounded ZIP members directly']
 
         # Limits to keep default JSON small.
         detailed = self.detailed_report
@@ -822,11 +867,14 @@ class APKAnalyzer:
         ioc_counts = {"Presence of Tor": 0, "URLs": 0, "IP Addresses": 0}
         total = 0
         try:
-            members = list(axml_obj.get_files() or [])
+            with zipfile.ZipFile(self.full_path_file) as archive:
+                members = [(info.filename, info.file_size) for info in archive.infolist() if not info.is_dir()]
         except Exception:
             members = []
 
-        for member in members:
+        rs['member_limit_reached'] = len(members) > 1024
+        read_bytes = 0
+        for member, declared_size in members[:1024]:
             if total >= max_iocs_total:
                 break
             m = str(member or "")
@@ -838,15 +886,24 @@ class APKAnalyzer:
             if ftype and ("image" in ftype.lower()):
                 continue
 
+            if declared_size > max_file_bytes:
+                rs['skipped_large_files'] += 1
+                continue
+            if read_bytes + declared_size > 64 * 1024 * 1024:
+                rs['byte_budget_reached'] = True
+                break
             try:
-                buf = axml_obj.get_file(m)
+                with zipfile.ZipFile(self.full_path_file) as archive, archive.open(m) as source:
+                    buf = source.read(max_file_bytes + 1)
             except Exception:
+                rs['unreadable_members'] = rs.get('unreadable_members', 0) + 1
                 continue
             if not isinstance(buf, (bytes, bytearray)):
                 continue
             if len(buf) > max_file_bytes:
                 rs["skipped_large_files"] += 1
                 continue
+            read_bytes += len(buf)
 
             text = ""
             try:
@@ -984,7 +1041,7 @@ class APKAnalyzer:
         except Exception:
             pass
 
-    def yara_rule_scanner(self, filename, report_object, quiet_nomatch=False, header_label=""):
+    def yara_rule_scanner(self, filename, report_object, quiet_nomatch=False, header_label="", android_metadata=None):
         # Use shared scanner from Modules/analysis/multiple/multi.py
         return shared_yara_rule_scanner(
             self.rule_path,
@@ -993,7 +1050,50 @@ class APKAnalyzer:
             quiet_nomatch=quiet_nomatch,
             header_label=header_label,
             detailed_key="yara_detailed_matches",
+            android_metadata=android_metadata,
         )
+
+    def scan_apk_members(self, metadata=None):
+        """Scan decompressed code/assets with per-member provenance and limits."""
+        started = time.monotonic()
+        budget = ArchiveBudget(total_bytes=128 * 1024 * 1024, members=64)
+        result = {'status': 'ok', 'members': [], 'scope': 'DEX, class files and non-native assets',
+                  'time_budget_seconds': 60, 'time_budget_scope': 'between members; each rule also has a match timeout',
+                  'skipped': 0}
+        self.reportz['apk_member_scan'] = result
+        try:
+            with zipfile.ZipFile(self.full_path_file) as archive:
+                candidates = [info for info in archive.infolist() if not info.is_dir() and
+                              (info.filename.lower().endswith(('.dex', '.class')) or
+                               (info.filename.startswith('assets/') and not info.filename.lower().endswith('.so')))]
+                # Prioritize executable bytecode before assets.
+                candidates.sort(key=lambda info: (not info.filename.lower().endswith('.dex'), info.filename))
+                for index, info in enumerate(candidates):
+                    if len(result['members']) >= 64 or time.monotonic() - started >= 60:
+                        result['skipped'] += len(candidates) - index
+                        result['status'] = 'partial'
+                        break
+                    extracted = budget.extract(archive, info, self.workspace / 'apk-members')
+                    if extracted is None:
+                        continue
+                    member_report = {}
+                    shared_yara_rule_scanner(self.rule_path, extracted, member_report,
+                        quiet_nomatch=True, quiet_errors=True, print_matches=False,
+                        detailed_key='matches', android_metadata=metadata)
+                    for item in member_report.get('matches', []):
+                        item.update(apk=self.full_path_file, member=info.filename, offset_basis='uncompressed_member')
+                    result['members'].append({'member': info.filename, 'size': info.file_size,
+                        'matches': member_report.get('matches', []),
+                        'scans': member_report.get('yara_scans', []),
+                        'warnings': member_report.get('yara_scan_warnings', [])})
+                    if any(scan['status'] != 'complete' for scan in member_report.get('yara_scans', [])):
+                        result['status'] = 'partial'
+        except (OSError, zipfile.BadZipFile) as error:
+            result.update(status='error', error=str(error))
+        result['extraction'] = budget.report()
+        if budget.skipped and result['status'] == 'ok':
+            result['status'] = 'partial'
+        result['elapsed_seconds'] = round(time.monotonic() - started, 3)
 
     def MultiYaraScanner(self):
         # Native library scanning should not depend on JADX success; we can always
@@ -1001,17 +1101,17 @@ class APKAnalyzer:
         lib_files_indicator = 0
         scanned = 0
         matched = 0
-        self.reportz["decompilation"]["output_dir"] = "TargetAPK"
+        self.reportz["decompilation"]["output_dir"] = self.apk_dir
         self.reportz["decompilation"]["warning"] = ""
         self.reportz["decompilation"]["warning_detail"] = ""
         # Try to decompile (optional). Even if this fails, continue with zip-based extraction.
         if self.decompiler_path and os.path.exists(self.decompiler_path):
-            if os.path.exists("TargetAPK"):
+            if os.path.exists(self.apk_dir):
                 self.reportz["decompilation"]["success"] = True
             else:
                 print(f"{infoS} Decompiling target APK file...")
                 self.reportz["decompilation"]["attempted"] = True
-                if self.run_decompiler("TargetAPK"):
+                if self.run_decompiler(self.apk_dir):
                     if self.last_decompile_warning:
                         self.reportz["decompilation"]["warning"] = self.last_decompile_warning
                         self.reportz["decompilation"]["warning_detail"] = self.last_decompile_warning_detail
@@ -1026,19 +1126,13 @@ class APKAnalyzer:
 
         # Collect libraries from JADX output (if any) and directly from the APK zip.
         libs = []
-        jadx_libs = self._list_so_files_in_dir(f"TargetAPK{path_seperator}resources{path_seperator}")
+        jadx_libs = self._list_so_files_in_dir(f"{self.apk_dir}{path_seperator}resources{path_seperator}")
         for p in jadx_libs:
             libs.append({"path": p, "source": "jadx_output", "zip_path": "", "size": os.path.getsize(p) if os.path.exists(p) else 0})
 
         # Keep native-lib extraction separate from `TargetAPK/` so we don't
         # accidentally make other stages think decompilation output exists.
-        extracted_dir = "NativeLibs_extracted"
-        # Keep the directory deterministic, but avoid stale results.
-        try:
-            if os.path.isdir(extracted_dir):
-                shutil.rmtree(extracted_dir)
-        except Exception:
-            pass
+        extracted_dir = str(self.workspace / "native-libraries")
         zip_libs = self.extract_native_libs_from_apk(extracted_dir)
         for item in zip_libs:
             libs.append({"path": item["path"], "source": "apk_zip", "zip_path": item.get("zip_path", ""), "size": item.get("size", 0)})
@@ -1327,15 +1421,15 @@ class APKAnalyzer:
     # Source code analysis
     def ScanSource(self):
         # Check for decompiled source
-        if os.path.exists(f"TargetAPK{path_seperator}"):
+        if os.path.exists(f"{self.apk_dir}{path_seperator}"):
             # Prepare source files
-            path = f"TargetAPK{path_seperator}sources{path_seperator}"
+            path = f"{self.apk_dir}{path_seperator}sources{path_seperator}"
             fnames = self.recursive_dir_scan(path)
             if fnames != []:
                 print(f"\n{infoS} Preparing source files...")
                 target_source_files = []
                 for sources in track(range(len(fnames)), description="Processing files..."):
-                    sanitized = fnames[sources].replace(f"TargetAPK{path_seperator}sources{path_seperator}", "")
+                    sanitized = fnames[sources].replace(f"{self.apk_dir}{path_seperator}sources{path_seperator}", "")
                     # Skip high-noise paths early (previously still scanned but would just KeyError/skip).
                     if ("android" in sanitized) or ("kotlin" in sanitized):
                         continue
@@ -1348,10 +1442,10 @@ class APKAnalyzer:
                     file_report = {}
                     for scode in track(range(len(target_source_files)), description="Analyzing..."):
                         src_rel = target_source_files[scode]
-                        src_path = f"TargetAPK{path_seperator}sources{path_seperator}{src_rel}"
+                        src_path = f"{self.apk_dir}{path_seperator}sources{path_seperator}{src_rel}"
                         try:
                             with open(src_path, "r", errors="ignore") as f:
-                                scode_buffer = f.read()
+                                scode_buffer = f.read(4 * 1024 * 1024)
                         except Exception:
                             continue
 
@@ -1425,8 +1519,8 @@ class APKAnalyzer:
         # Executing decompiler...
         print(f"{infoS} Decompiling target file...")
         self.reportz["decompilation"]["attempted"] = True
-        self.reportz["decompilation"]["output_dir"] = "TargetSource"
-        if not self.run_decompiler("TargetSource"):
+        self.reportz["decompilation"]["output_dir"] = self.jar_dir
+        if not self.run_decompiler(self.jar_dir):
             self.reportz["decompilation"]["error"] = self.last_decompile_error
             self.reportz["decompilation"]["error_detail"] = self.last_decompile_error_detail
             return
@@ -1436,14 +1530,14 @@ class APKAnalyzer:
         self.reportz["decompilation"]["success"] = True
 
         # If we successfully decompiled the target file
-        if not os.path.exists("TargetSource"):
+        if not os.path.exists(self.jar_dir):
             print("[bold white on red]Couldn\'t locate source codes. Did target file decompiled correctly?")
             print(f">>>[bold yellow] Hint: [white]Decompiler execution failed or target is malformed.")
             self.reportz["decompilation"]["error"] = "target_source_not_found"
             return
 
         # Reading MANIFEST file
-        manifest_path = f"TargetSource{path_seperator}resources{path_seperator}META-INF{path_seperator}MANIFEST.MF"
+        manifest_path = f"{self.jar_dir}{path_seperator}resources{path_seperator}META-INF{path_seperator}MANIFEST.MF"
         if os.path.exists(manifest_path):
             print(f"\n{infoS} MANIFEST file found. Fetching data...")
             data = open(manifest_path).read()
@@ -1461,11 +1555,11 @@ class APKAnalyzer:
             print(f"{errorS} MANIFEST.MF could not be found in decompiled output.")
 
         # Prepare source files
-        fnames = self.recursive_dir_scan(target_directory=f"TargetSource{path_seperator}sources{path_seperator}")
+        fnames = self.recursive_dir_scan(target_directory=f"{self.jar_dir}{path_seperator}sources{path_seperator}")
         print(f"{infoS} Preparing source files...")
         target_source_files = []
         for sources in track(range(len(fnames)), description="Processing files..."):
-            sanitized = fnames[sources].replace(f'TargetSource{path_seperator}sources{path_seperator}', '')
+            sanitized = fnames[sources].replace(f'{self.jar_dir}{path_seperator}sources{path_seperator}', '')
             if ("android" not in sanitized) and ("kotlin" not in sanitized):
                 target_source_files.append(sanitized)
 
@@ -1474,10 +1568,10 @@ class APKAnalyzer:
         t0 = time.perf_counter()
         for scode in track(range(len(target_source_files)), description="Analyzing..."):
             src_rel = target_source_files[scode]
-            src_path = f"TargetSource{path_seperator}sources{path_seperator}{src_rel}"
+            src_path = f"{self.jar_dir}{path_seperator}sources{path_seperator}{src_rel}"
             try:
                 with open(src_path, "r", errors="ignore") as f:
-                    scode_buffer = f.read()
+                    scode_buffer = f.read(4 * 1024 * 1024)
             except Exception:
                 continue
 
@@ -1502,13 +1596,13 @@ class APKAnalyzer:
         self.reportz["decompilation"] = {
             "attempted": False,
             "success": False,
-            "output_dir": "TargetAPK",
+            "output_dir": self.apk_dir,
             "error": "",
             "error_detail": "",
             "warning": "",
             "warning_detail": ""
         }
-        if os.path.exists("TargetAPK"):
+        if os.path.exists(self.apk_dir):
             self.reportz["decompilation"]["success"] = True
             self.ScanSource()
         else:
@@ -1520,7 +1614,7 @@ class APKAnalyzer:
                 return
             print(f"{infoS} Decompiling target file...")
             self.reportz["decompilation"]["attempted"] = True
-            if not self.run_decompiler("TargetAPK"):
+            if not self.run_decompiler(self.apk_dir):
                 self.reportz["decompilation"]["error"] = self.last_decompile_error
                 self.reportz["decompilation"]["error_detail"] = self.last_decompile_error_detail
                 return
@@ -1532,23 +1626,18 @@ class APKAnalyzer:
 
     def get_possible_package_names(self):
         print(f"\n{infoS} Looking for package name...")
-        # Handle aapt2 errors and get package_name anyway
-        package_name_proc = subprocess.run(f"aapt2 dump packagename \"{self.target_file}\"", shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        if package_name_proc.returncode == 0:
-            package_name = package_name_proc.stdout.decode().strip('\n')
-            return package_name
-        else:
-            try:
-                # Get package_name from error message
-                package_name = re.findall(r"com.[a-z0-9]*.[a-z0-9]*", package_name_proc.stderr.decode())[0]
-                return package_name
-            except:
-                return None
+        try:
+            proc = subprocess.run(["aapt2", "dump", "packagename", self.full_path_file],
+                                  capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        candidate = proc.stdout.strip()
+        return candidate if proc.returncode == 0 and re.fullmatch(r"[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+", candidate) else None
 
     def pattern_scanner_ex(self, regex, target_files, target_type, value_array):
         for url in track(range(len(target_files)), description=f"Processing {target_type}..."):
             try:
-                source_buffer = open(target_files[url], "r").read()
+                source_buffer = open(target_files[url], "r", errors="replace").read(4 * 1024 * 1024)
                 url_regex = re.findall(regex, source_buffer)
                 if url_regex != []:
                     for val in url_regex:
@@ -1562,7 +1651,7 @@ class APKAnalyzer:
 
     def pattern_scanner(self, target_pattern):
         extracted_values = []
-        path = f"TargetAPK{path_seperator}sources{path_seperator}"
+        path = f"{self.apk_dir}{path_seperator}sources{path_seperator}"
         fnames = self.recursive_dir_scan(path)
         if fnames != []:
             self.pattern_scanner_ex(regex=target_pattern,
@@ -1570,7 +1659,7 @@ class APKAnalyzer:
                             target_type="sources",
                             value_array=extracted_values
             )
-        path = f"TargetAPK{path_seperator}resources{path_seperator}"
+        path = f"{self.apk_dir}{path_seperator}resources{path_seperator}"
         fnames = self.recursive_dir_scan(path)
         if fnames != []:
             self.pattern_scanner_ex(regex=target_pattern,
@@ -1587,33 +1676,26 @@ class APKAnalyzer:
     # Scan files for url and ip patterns
     def Get_IP_URL(self):
         print(f"\n{infoS} Looking for possible IP address patterns. Please wait...")
-        ip_vals = self.pattern_scanner(target_pattern=r"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$")
-        # Extract ip addresses from file
-        if ip_vals != []:
-            ipTables = Table()
-            ipTables.add_column("[bold green]IP Address", justify="center")
-            ipTables.add_column("[bold green]Country", justify="center")
-            ipTables.add_column("[bold green]City", justify="center")
-            ipTables.add_column("[bold green]Region", justify="center")
-            ipTables.add_column("[bold green]ISP", justify="center")
-            ipTables.add_column("[bold green]Proxy", justify="center")
-            ipTables.add_column("[bold green]Hosting", justify="center")
-            for ips in ip_vals:
-                if ips[0] != '0':
-                    data = requests.get(f"http://ip-api.com/json/{ips}?fields=status,message,country,countryCode,region,regionName,city,isp,proxy,hosting")
-                    if data.json()['status'] != 'fail':
-                        ipTables.add_row(
-                            str(ips), str(data.json()['country']), 
-                            str(data.json()['city']), 
-                            str(data.json()['regionName']), 
-                            str(data.json()['isp']),
-                            str(data.json()['proxy']),
-                            str(data.json()['hosting'])
-                        )
-            print(ipTables)
+        import ipaddress
+        candidates = self.pattern_scanner(target_pattern=r"(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w.])")
+        ip_vals = []
+        for value in candidates:
+            try:
+                parsed = str(ipaddress.IPv4Address(value))
+                if parsed not in ip_vals:
+                    ip_vals.append(parsed)
+            except ValueError:
+                continue
+        self.reportz["extracted_ips"] = ip_vals
+        self.reportz["ioc_context"] = "Embedded literals; not evidence of network communication."
+        if ip_vals:
+            ip_table = Table("Embedded IP address")
+            for value in ip_vals:
+                ip_table.add_row(value)
+            print(ip_table)
         else:
             print(f"{errorS} There is no possible IP address pattern found!")
-    
+
         # Extract url values
         print(f"\n{infoS} Looking for URL values. Please wait...")
         url_vals = self.pattern_scanner(target_pattern=r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
@@ -1646,6 +1728,7 @@ class APKAnalyzer:
 
                 filtered_urls.append(uvs)
 
+            self.reportz["extracted_urls"] = filtered_urls
             if filtered_urls:
                 for u in filtered_urls:
                     urltable.add_row(u)
@@ -1656,10 +1739,7 @@ class APKAnalyzer:
             print(f"{errorS} There is no URL pattern found!")
 
     # Permission analyzer
-    def Analyzer(self, parsed):
-        global danger
-        global normal
-        global special
+    def Analyzer(self, parsed, *, observed_permissions=None, coverage='complete'):
         danger = 0
         normal = 0
         special = 0
@@ -1671,7 +1751,7 @@ class APKAnalyzer:
         with open(f"{sc0pe_path}{path_seperator}Systems{path_seperator}Android{path_seperator}perms.json", "r") as f:
             permissions = json.load(f)
 
-        apkPerms = parsed.get_permissions()
+        apkPerms = parsed.get_permissions() if observed_permissions is None else observed_permissions
         risk_by_name = {}
         risk_by_constant = {}
 
@@ -1708,6 +1788,7 @@ class APKAnalyzer:
                 normal += 1
 
         self.reportz["permission_summary"] = {
+            "status": coverage,
             "dangerous": danger,
             "special": special,
             "info": normal,
@@ -1715,7 +1796,8 @@ class APKAnalyzer:
 
         # If there is no permission:
         if danger == 0 and normal == 0 and special == 0:
-            print("\n[bold white on red]There is no permissions found!\n")
+            print("\nNo requested permissions observed." if coverage == 'complete'
+                  else "\nRequested permissions could not be fully determined.")
         else:
             print(statistics)
 
@@ -1784,6 +1866,7 @@ class APKAnalyzer:
             self.reportz["app_name"] = axml_obj.get_app_name()
             self.reportz["package_name"] = axml_obj.get_package()
         else:
+            package_names = self.get_possible_package_names()
             print(f"[bold red]>>>>[white] Possible Package Name: [bold green]{package_names}")
             self.reportz["package_name"] = package_names
             self.reportz["app_name"] = None
@@ -1792,7 +1875,7 @@ class APKAnalyzer:
         if axml_obj:
             print(f"\n{infoS} Sending query to Google Play Store about target application.")
             try:
-                playinf = requests.get(f"https://play.google.com/store/apps/details?id={axml_obj.get_package()}")
+                playinf = requests.get(f"https://play.google.com/store/apps/details?id={axml_obj.get_package()}", timeout=5)
                 if playinf.ok:
                     print("[bold red]>>>>[white] Google Play Store: [bold green]Found\n")
                     self.reportz["play_store"] = True
@@ -1805,7 +1888,7 @@ class APKAnalyzer:
         else:
             print(f"\n{infoS} Sending query to Google Play Store about target application.")
             try:
-                playinf = requests.get(f"https://play.google.com/store/apps/details?id={package_names}")
+                playinf = requests.get(f"https://play.google.com/store/apps/details?id={package_names}", timeout=5)
                 if playinf.ok:
                     print("[bold red]>>>>[white] Google Play Store: [bold green]Found\n")
                     self.reportz["play_store"] = True
@@ -1845,6 +1928,9 @@ class APKAnalyzer:
 
 # Execution
 if __name__ == '__main__':
+    if len(sys.argv) != 4 or sys.argv[2] not in ('True', 'False') or sys.argv[3] not in ('APK', 'DEX', 'JAR'):
+        raise SystemExit('Usage: apkAnalyzer.py FILE True|False APK|DEX|JAR')
+    targetAPK = sys.argv[1]
     try:
         # Create object
         apka = APKAnalyzer(target_file=targetAPK)
@@ -1868,11 +1954,11 @@ if __name__ == '__main__':
             axml_obj = pyaxmlparser.APK(targetAPK)
             # In case of package name parsing issues
             if axml_obj.get_package() == '':
-                print(f"\n{errorS} It looks like the target [bold green]AndroidManifest.xml[white] is corrupted!!")
+                print(f"\n{errorS} This parser could not decode AndroidManifest.xml; checking APK identity.")
                 axml_obj = None
                 package_names = apka.get_possible_package_names()
         except:
-            print(f"\n{errorS} It looks like the target [bold green]AndroidManifest.xml[white] is corrupted!!")
+            print(f"\n{errorS} This parser could not decode AndroidManifest.xml; checking APK identity.")
             axml_obj = None
             package_names = apka.get_possible_package_names()
 
@@ -1885,16 +1971,36 @@ if __name__ == '__main__':
         except:
             parsed = None
 
-        if parsed:
+        if parsed and parsed.is_valid_APK():
             # Permissions side
             apka.Analyzer(parsed)
 
             # Deep scanner
             apka.DeepScan(parsed)
 
+        else:
+            try:
+                identity = apk_info(targetAPK, parsed)
+                apka.reportz['apk_identity'] = identity
+                if 'permissions' in identity:
+                    apka.Analyzer(parsed, observed_permissions=identity['permissions'], coverage='partial')
+                else:
+                    apka.reportz['permission_summary'] = {'status': 'unavailable'}
+            except Exception as error:
+                apka.reportz['permission_summary'] = {'status': 'unavailable', 'error': str(error)}
+
+        apka.reportz["manifest_security"] = analyze_apk_manifest(parsed)
+        print_security_report(apka.reportz["manifest_security"])
+
         # Yara matches
         print(f"\n{infoS} Performing YARA rule matching...")
-        apka.yara_rule_scanner(targetAPK, report_object=apka.reportz)
+        metadata, metadata_errors = apk_metadata(parsed)
+        for error in metadata_errors:
+            apka.reportz.setdefault("yara_scan_warnings", []).append({
+                "type": "metadata_extraction_error", "target": targetAPK, "error": error,
+            })
+        apka.yara_rule_scanner(targetAPK, report_object=apka.reportz, android_metadata=metadata)
+        apka.scan_apk_members(metadata)
 
         # Decompiling and scanning libraries
         print(f"\n{infoS} Performing library analysis...")
@@ -1906,8 +2012,10 @@ if __name__ == '__main__':
 
         # Malware family detection
         print(f"\n{infoS} Performing malware family detection. Please wait!!")
-        command = f"{py_binary} {sc0pe_path}{path_seperator}Modules{path_seperator}andro_familydetect.py \"{targetAPK}\""
-        os.system(command)
+        from andro_familydetect import AndroidFamilyDetect
+        apka.reportz["family_detection"] = AndroidFamilyDetect(
+            targetAPK, source_dir=apka.apk_dir, apk=parsed).CheckFamily()
+
 
         # Source code analysis zone
         print(f"\n{infoS} Performing source code analysis...")

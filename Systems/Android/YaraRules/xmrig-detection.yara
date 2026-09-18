@@ -1,6 +1,3 @@
-import "cuckoo"
-
-
 rule xmrigStrings
 {
     strings:
@@ -14,5 +11,5 @@ rule xmrigStrings
        $fee and
        $nicehash and
        $minergate and
-       $stratum 
+       $stratum
 }

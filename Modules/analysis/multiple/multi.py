@@ -11,6 +11,7 @@ import threading
 from rich import print
 from rich.table import Table
 from rich.markup import escape
+from .android_yara import AndroidRules, compile_rule_file
 
 # Compatibility
 path_seperator = "/"
@@ -193,6 +194,7 @@ atexit.register(_cleanup_owned_strings_file)
 # YARA RULE CACHE (rule_dir -> list[(rule_file, yara.Rules)])
 _YARA_RULE_CACHE = {}
 _YARA_RULE_CACHE_ERR = {}
+_YARA_RULE_FAILURES = {}
 _YARA_MATCH_TIMEOUT_SECONDS = 2
 
 def _resolve_rule_dir(rulepath):
@@ -213,6 +215,8 @@ def _load_yara_rules(rule_dir):
 
     compiled = []
     err = ""
+    failures = []
+    _YARA_RULE_FAILURES[rule_dir] = failures
     try:
         files = sorted(os.listdir(rule_dir))
     except Exception as e:
@@ -227,15 +231,18 @@ def _load_yara_rules(rule_dir):
             continue
         full = os.path.join(rule_dir, rf)
         try:
-            compiled.append((rf, yara.compile(filepath=full)))
-        except Exception:
+            compiled.append((rf, compile_rule_file(full)))
+        except Exception as exc:
             failed += 1
+            failures.append({"rule_file": full, "error": str(exc)})
             continue
 
     if not compiled:
         err = "no_rules_compiled"
         if failed:
             err = f"no_rules_compiled_failed={failed}"
+    elif failed:
+        err = f"partial_rule_load_failed={failed}"
 
     _YARA_RULE_CACHE[rule_dir] = compiled
     _YARA_RULE_CACHE_ERR[rule_dir] = err
@@ -252,6 +259,7 @@ def yara_rule_scanner(
     detailed_key=None,
     print_matches=True,
     print_nomatch=True,
+    android_metadata=None,
 ):
     """
     Shared YARA scanner with rule caching.
@@ -266,23 +274,44 @@ def yara_rule_scanner(
                     reported because silently skipping a rule can create a
                     false-negative impression.
       detailed_key: report key for detailed per-target matches (default: None)
+      android_metadata: parsed Koodous field -> list of values; absent fields
+                        stay unknown and make the scan partial
 
     Returns True if any rule matched; False otherwise.
     """
     yara_match_indicator = 0
     report_object.setdefault("matched_rules", [])
     report_object.setdefault("yara_scan_warnings", [])
+    scan = {"target": str(filename), "rule_directory": str(rulepath),
+            "status": "error", "loaded_rule_files": 0, "matched_rules": 0}
+    report_object.setdefault("yara_scans", []).append(scan)
     if detailed_key:
         report_object.setdefault(detailed_key, [])
 
     rule_dir = _resolve_rule_dir(rulepath)
     if not rule_dir:
+        report_object["yara_scan_warnings"].append({"type": "rule_directory_error",
+            "target": str(filename), "rule_directory": str(rulepath)})
         if not quiet_errors:
             print(f"[bold white on red]YARA rule directory could not be resolved for: {rulepath}")
         return False
 
     compiled_rules = _load_yara_rules(rule_dir)
+    failures = _YARA_RULE_FAILURES.get(rule_dir, [])
+    scan.update(rule_directory=rule_dir, loaded_rule_files=len(compiled_rules),
+                status="partial" if failures else "complete")
+    for failure in failures:
+        warning = dict(failure, type="compile_error", target=str(filename))
+        if warning not in report_object["yara_scan_warnings"]:
+            report_object["yara_scan_warnings"].append(warning)
+    if failures and not quiet_errors:
+        print(f"[bold yellow]YARA scan incomplete:[white] {len(failures)} rule file(s) could not be compiled.")
     if not compiled_rules:
+        scan["status"] = "error"
+        if not failures:
+            report_object["yara_scan_warnings"].append({"type": "rule_load_error",
+                "target": str(filename), "rule_directory": rule_dir,
+                "error": _YARA_RULE_CACHE_ERR.get(rule_dir, "no_rules_compiled")})
         if not quiet_errors:
             err = _YARA_RULE_CACHE_ERR.get(rule_dir, "")
             print(f"[bold white on red]No YARA rules could be loaded from: {rule_dir} ({err})")
@@ -297,8 +326,21 @@ def yara_rule_scanner(
             # document scan for minutes on multi-megabyte script samples.
             # YARA enforces this deadline internally, so it also interrupts
             # native matching work that a Python-side timer cannot preempt.
-            tempmatch = rules.match(filename, timeout=_YARA_MATCH_TIMEOUT_SECONDS)
+            options = {}
+            if isinstance(rules, AndroidRules):
+                missing = sorted(rules.fields - (android_metadata or {}).keys())
+                if missing:
+                    scan["status"] = "partial"
+                    scan["metadata_unavailable_rule_files"] = scan.get("metadata_unavailable_rule_files", 0) + 1
+                    scan["metadata_fields_unavailable"] = sorted(set(scan.get("metadata_fields_unavailable", [])) | set(missing))
+                    report_object["yara_scan_warnings"].append({
+                        "type": "metadata_unavailable", "target": str(filename),
+                        "rule_file": str(rule_file), "fields": missing,
+                    })
+                options["metadata"] = android_metadata
+            tempmatch = rules.match(filename, timeout=_YARA_MATCH_TIMEOUT_SECONDS, **options)
         except yara.TimeoutError:
+            scan["status"] = "partial"
             warning = {
                 "type": "match_timeout",
                 "target": str(filename),
@@ -309,12 +351,17 @@ def yara_rule_scanner(
                 report_object["yara_scan_warnings"].append(warning)
             timed_out_rule_files.append(str(rule_file))
             continue
-        except Exception:
+        except Exception as exc:
+            scan["status"] = "partial"
+            report_object["yara_scan_warnings"].append({"type": "match_error",
+                "target": str(filename), "rule_file": str(rule_file), "error": str(exc)})
             continue
         if tempmatch:
-            for matched in tempmatch:
-                if matched.strings:
-                    yara_matches.append(matched)
+            yara_matches.extend(tempmatch)
+
+    if scan.get("metadata_unavailable_rule_files") and not quiet_errors:
+        print(f"[bold yellow]YARA scan incomplete:[white] metadata unavailable for "
+              f"{scan['metadata_unavailable_rule_files']} rule file(s); see yara_scan_warnings.")
 
     if timed_out_rule_files:
         shown = ", ".join(escape(name) for name in timed_out_rule_files[:5])
@@ -329,6 +376,7 @@ def yara_rule_scanner(
         )
 
     # Printing area
+    scan["matched_rules"] = len(yara_matches)
     if yara_matches != []:
         yara_match_indicator += 1
         for rul in yara_matches:
@@ -358,11 +406,16 @@ def yara_rule_scanner(
             if detailed_key:
                 report_object[detailed_key].append(detailed)
             if print_matches:
+                if not rul.strings:
+                    yaraTable.add_row("—", "Rule condition matched; no string instances")
                 print(yaraTable)
                 print(" ")
 
     if yara_match_indicator == 0:
         if (not quiet_nomatch) and print_nomatch:
-            print(f"[bold white on red]There is no rules matched for {filename}")
+            if scan["status"] == "partial":
+                print(f"[bold yellow]No matches in scanned rules; YARA scan incomplete for {escape(str(filename))}")
+            else:
+                print(f"[bold white on red]There is no rules matched for {escape(str(filename))}")
         return False
     return True

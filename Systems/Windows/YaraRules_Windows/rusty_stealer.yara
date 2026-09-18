@@ -1,9 +1,11 @@
 rule RustyStealer_Detect {
     meta:
         author = "Mehmet Ali Kerimoglu (@CYB3RMX)"
-        description = "This rule detects RustyStealer patterns."
+        description = "Hunting rule for Rust binaries containing sample-associated build paths; requires analyst confirmation."
         reference = "https://github.com/CYB3RMX/Qu1cksc0pe"
         date = "07/07/2023"
+        modified = "2026-09-15"
+        classification = "hunting"
     strings:
         $rusty1 = ".cargo" ascii wide
         $rusty2 = "rust_panic" ascii wide
@@ -24,5 +26,9 @@ rule RustyStealer_Detect {
         $pattern14 = "C:\\Users\\user\\Documents\\Project\\check_name\\target\\debug\\deps\\FingerPrint_disable_x64.pdb" ascii wide
         $pattern15 = "args.rscmd.exe" ascii wide
     condition:
-        ((2 or all of ($rusty*)) and (3 or all of ($pattern*)))
+        // Numeric constants in an OR expression are true, not string counts.
+        // Rust runtime, Cargo paths and certificate OIDs also occur in benign
+        // programs. Require a sample-associated build path in addition.
+        2 of ($rusty*) and 3 of ($pattern*)
+        and 1 of ($pattern1, $pattern2, $pattern7, $pattern10, $pattern14)
 }

@@ -74,6 +74,10 @@ sc0pe_reports/
 sc0pe_*_report.json
 sc0pe_process-*.json
 qu1cksc0pe_memory_dump_*.bin
+qu1cksc0pe_memory_dump_*.bin.json
+qu1cksc0pe_memory_dump_*.bin.tmp
+sc0pe_process-*.json.tmp
+memory_regions/
 qu1cksc0pe_carved*
 qu1cksc0pe_decrypted_*
 qu1cksc0pe_decoded_*

@@ -89,3 +89,20 @@ def save_report(target_os, report):
     with open(f"sc0pe_{target_os}_report.json", "w") as report_file:
         json.dump(report, report_file, indent=4)
         print(f"\n[bold magenta]>>>[bold white] Report file saved into: [bold blink yellow]{report_file.name}\n")
+def run_interactive_monitor(command, env=None):
+    """Let the console-attached monitor finish detach/report cleanup on Ctrl+C."""
+    import signal
+    import subprocess
+    with subprocess.Popen(command, env=env) as child:
+        signals = [signal.SIGINT]
+        if hasattr(signal, 'SIGBREAK'):
+            signals.append(signal.SIGBREAK)
+        previous = {sig: signal.getsignal(sig) for sig in signals}
+        try:
+            # Use a Python handler: SIG_IGN can be inherited by subprocesses.
+            for sig in signals:
+                signal.signal(sig, lambda signum, frame: None)
+            return subprocess.CompletedProcess(command, child.wait())
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)

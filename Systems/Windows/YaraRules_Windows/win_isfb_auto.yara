@@ -31,7 +31,7 @@ rule win_isfb_auto {
     strings:
         $sequence_0 = { e8???????? eb02 33c0 3bc7 741b 50 33c0 }
             // n = 7, score = 2500
-            //   e8????????           |                     
+            //   e8????????           |
             //   eb02                 | mov                 dword ptr [ebp - 8], eax
             //   33c0                 | mov                 ebx, eax
             //   3bc7                 | push                ebx
@@ -42,7 +42,7 @@ rule win_isfb_auto {
         $sequence_1 = { 33c0 e8???????? 3bc7 740f }
             // n = 4, score = 2500
             //   33c0                 | mov                 dword ptr [ebp - 8], eax
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc7                 | cmp                 edi, esi
             //   740f                 | je                  0x10
 
@@ -52,7 +52,7 @@ rule win_isfb_auto {
             //   ff75f0               | mov                 ecx, edi
             //   ff75f4               | dec                 esp
             //   6822010000           | mov                 dword ptr [ebp + ebx*8], esp
-            //   e9????????           |                     
+            //   e9????????           |
             //   ff7508               | add                 ebx, 1
 
         $sequence_3 = { 50 6a10 58 e8???????? 3bc7 7406 }
@@ -60,7 +60,7 @@ rule win_isfb_auto {
             //   50                   | cmp                 eax, ebx
             //   6a10                 | je                  0xa
             //   58                   | push                eax
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc7                 | cmp                 edi, ebx
             //   7406                 | cmp                 eax, ebx
 
@@ -77,24 +77,24 @@ rule win_isfb_auto {
             // n = 7, score = 2200
             //   57                   | push                ebx
             //   50                   | mov                 ebx, 0xea60
-            //   e8????????           |                     
+            //   e8????????           |
             //   83c40c               | jne                 7
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc7                 | push                ebx
             //   8945f0               | mov                 ebx, 0xea60
 
         $sequence_6 = { ff15???????? a1???????? 85c0 7407 83ee64 }
             // n = 5, score = 2200
-            //   ff15????????         |                     
-            //   a1????????           |                     
+            //   ff15????????         |
+            //   a1????????           |
             //   85c0                 | cmp                 eax, ebx
             //   7407                 | jne                 0x14
             //   83ee64               | cmp                 eax, ebx
 
         $sequence_7 = { ff35???????? e8???????? 8bf0 3bf3 7443 }
             // n = 5, score = 2200
-            //   ff35????????         |                     
-            //   e8????????           |                     
+            //   ff35????????         |
+            //   e8????????           |
             //   8bf0                 | push                eax
             //   3bf3                 | xor                 eax, eax
             //   7443                 | cmp                 eax, edi
@@ -105,14 +105,14 @@ rule win_isfb_auto {
             //   5b                   | dec                 eax
             //   59                   | cmp                 eax, ebx
             //   c20400               | je                  0xe8
-            //   8325????????00       |                     
+            //   8325????????00       |
             //   6a00                 | push                ebx
 
         $sequence_9 = { ff15???????? 85c0 a3???????? 7402 ffe0 c20400 }
             // n = 6, score = 2100
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   85c0                 | pop                 eax
-            //   a3????????           |                     
+            //   a3????????           |
             //   7402                 | cmp                 eax, edi
             //   ffe0                 | je                  0xa
             //   c20400               | push                eax
@@ -122,7 +122,7 @@ rule win_isfb_auto {
             //   3bc7                 | je                  0x13
             //   7406                 | je                  0x1d
             //   50                   | push                eax
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bdf                 | xor                 eax, eax
             //   7414                 | cmp                 eax, edi
 
@@ -133,12 +133,12 @@ rule win_isfb_auto {
             //   55                   | dec                 ecx
             //   8bec                 | mov                 ecx, esp
             //   83ec0c               | je                  0x11
-            //   a1????????           |                     
+            //   a1????????           |
             //   8365f800             | xor                 edx, edx
 
         $sequence_12 = { ff15???????? 3c05 7506 84e4 7704 3ac0 }
             // n = 6, score = 1800
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   3c05                 | pop                 eax
             //   7506                 | cmp                 eax, edi
             //   84e4                 | cmp                 eax, edi
@@ -147,9 +147,9 @@ rule win_isfb_auto {
 
         $sequence_13 = { b8???????? 7505 b8???????? 53 bb60ea0000 53 ff750c }
             // n = 7, score = 1700
-            //   b8????????           |                     
+            //   b8????????           |
             //   7505                 | je                  0x21
-            //   b8????????           |                     
+            //   b8????????           |
             //   53                   | push                eax
             //   bb60ea0000           | xor                 eax, eax
             //   53                   | xor                 eax, eax
@@ -173,16 +173,16 @@ rule win_isfb_auto {
 
         $sequence_16 = { a1???????? 3bc3 7512 e8???????? 3bc3 a3???????? }
             // n = 6, score = 1700
-            //   a1????????           |                     
+            //   a1????????           |
             //   3bc3                 | xor                 eax, eax
             //   7512                 | cmp                 eax, edi
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc3                 | je                  0x16
-            //   a3????????           |                     
+            //   a3????????           |
 
         $sequence_17 = { e8???????? 8bd8 85db 895df4 0f84c7000000 56 53 }
             // n = 7, score = 1700
-            //   e8????????           |                     
+            //   e8????????           |
             //   8bd8                 | jmp                 4
             //   85db                 | xor                 eax, eax
             //   895df4               | cmp                 eax, edi
@@ -212,7 +212,7 @@ rule win_isfb_auto {
             // n = 6, score = 1700
             //   50                   | test                edi, edi
             //   ff7510               | dec                 esp
-            //   e8????????           |                     
+            //   e8????????           |
             //   83c40c               | mov                 esp, edi
             //   c745fc01000000       | jne                 0xffffffc6
             //   8b4610               | dec                 eax
@@ -227,7 +227,7 @@ rule win_isfb_auto {
 
         $sequence_22 = { e8???????? 8b07 c6400731 8b74241c }
             // n = 4, score = 1600
-            //   e8????????           |                     
+            //   e8????????           |
             //   8b07                 | jmp                 9
             //   c6400731             | xor                 ebx, ebx
             //   8b74241c             | jne                 0xffffffc6
@@ -236,7 +236,7 @@ rule win_isfb_auto {
             // n = 4, score = 1600
             //   6a00                 | push                dword ptr [ebp + 8]
             //   ff37                 | push                dword ptr [ebp - 0x10]
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   2b442414             | push                dword ptr [ebp - 0xc]
 
         $sequence_24 = { 2b4b28 894c2410 8b4b34 f6c140 }
@@ -264,10 +264,10 @@ rule win_isfb_auto {
 
         $sequence_27 = { ff35???????? 0fc8 50 a1???????? }
             // n = 4, score = 1600
-            //   ff35????????         |                     
+            //   ff35????????         |
             //   0fc8                 | push                0x10
             //   50                   | pop                 eax
-            //   a1????????           |                     
+            //   a1????????           |
 
         $sequence_28 = { 837b240c 56 57 8b3b 897c241c }
             // n = 5, score = 1600
@@ -279,7 +279,7 @@ rule win_isfb_auto {
 
         $sequence_29 = { e8???????? 85c0 740d 8906 83c604 47 83ff03 }
             // n = 7, score = 1600
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | xor                 eax, eax
             //   740d                 | cmp                 eax, edi
             //   8906                 | je                  0x19
@@ -298,7 +298,7 @@ rule win_isfb_auto {
 
         $sequence_31 = { ff15???????? 2b442414 50 8b07 03442418 }
             // n = 5, score = 1600
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   2b442414             | je                  0x45
             //   50                   | push                -1
             //   8b07                 | mov                 esi, eax
@@ -320,13 +320,13 @@ rule win_isfb_auto {
             //   50                   | push                eax
             //   53                   | push                ebx
             //   8bc6                 | mov                 eax, esi
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_34 = { 7408 ff7508 e8???????? 8bc7 5f 5e }
             // n = 6, score = 1500
             //   7408                 | je                  0xa
             //   ff7508               | push                dword ptr [ebp + 8]
-            //   e8????????           |                     
+            //   e8????????           |
             //   8bc7                 | mov                 eax, edi
             //   5f                   | pop                 edi
             //   5e                   | pop                 esi
@@ -343,7 +343,7 @@ rule win_isfb_auto {
             //   c744242860ea0000     | mov                 ebx, 0xea60
             //   4c0f45c8             | push                ebx
             //   48895c2420           | push                ebx
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_37 = { 750e 837d0800 7408 ff7508 }
             // n = 4, score = 1500
@@ -384,7 +384,7 @@ rule win_isfb_auto {
             //   83c301               | dec                 eax
             //   488d4801             | cmp                 ebx, edi
             //   66ba2000             | jne                 0x12
-            //   ff15????????         |                     
+            //   ff15????????         |
 
         $sequence_42 = { 4c8be7 75c4 48892e eb02 33db 488b0d???????? }
             // n = 6, score = 1400
@@ -393,14 +393,14 @@ rule win_isfb_auto {
             //   48892e               | dec                 eax
             //   eb02                 | cmp                 ebx, edi
             //   33db                 | dec                 esp
-            //   488b0d????????       |                     
+            //   488b0d????????       |
 
         $sequence_43 = { 740f 488b0d???????? 33d2 ff15???????? bb01000000 498bcc eb07 }
             // n = 7, score = 1400
             //   740f                 | mov                 eax, ebx
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   33d2                 | xor                 edx, edx
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   bb01000000           | dec                 eax
             //   498bcc               | mov                 ebx, edi
             //   eb07                 | mov                 esi, edi
@@ -417,7 +417,7 @@ rule win_isfb_auto {
             //   ff75fc               | pop                 ecx
             //   6a0d                 | ret                 4
             //   58                   | pop                 ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | pop                 ecx
             //   740d                 | ret                 4
 
@@ -427,13 +427,13 @@ rule win_isfb_auto {
             //   55                   | dec                 ecx
             //   8bec                 | mov                 ecx, esp
             //   83ec14               | dec                 ecx
-            //   a1????????           |                     
+            //   a1????????           |
             //   53                   | mov                 edi, ebp
 
         $sequence_47 = { 498bcc ff15???????? 33db 66ba2000 }
             // n = 4, score = 1400
             //   498bcc               | cmovne              ecx, eax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   33db                 | dec                 eax
             //   66ba2000             | mov                 dword ptr [esp + 0x20], ebx
 
@@ -442,14 +442,14 @@ rule win_isfb_auto {
             //   448bc3               | mov                 dword ptr [esp + 0x20], ebx
             //   33d2                 | test                eax, eax
             //   41c1e003             | dec                 eax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4885c0               | mov                 ecx, edi
             //   488be8               | mov                 dword ptr [esp + 0x28], 0xea60
             //   7453                 | dec                 esp
 
         $sequence_49 = { e8???????? 85c0 742d ff75fc 6a0d }
             // n = 5, score = 1400
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | push                0
             //   742d                 | push                1
             //   ff75fc               | mov                 eax, ebp
@@ -460,15 +460,15 @@ rule win_isfb_auto {
             //   33db                 | dec                 eax
             //   66ba2000             | cmp                 ebx, edi
             //   498bcc               | jne                 0xf
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4885c0               | dec                 esp
 
         $sequence_51 = { 6a01 ff75e0 68???????? e8???????? }
             // n = 4, score = 1400
             //   6a01                 | sbb                 eax, eax
             //   ff75e0               | and                 eax, 6
-            //   68????????           |                     
-            //   e8????????           |                     
+            //   68????????           |
+            //   e8????????           |
 
         $sequence_52 = { be01000000 8bc6 4883c440 415e 415d 415c 5f }
             // n = 7, score = 1400
@@ -484,7 +484,7 @@ rule win_isfb_auto {
             // n = 7, score = 1400
             //   c60000               | dec                 eax
             //   488bcf               | cmp                 ebx, edi
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4c8964dd00           | dec                 eax
             //   83c301               | mov                 ebx, edi
             //   4885ff               | mov                 esi, edi
@@ -502,30 +502,30 @@ rule win_isfb_auto {
             //   6641b85c00           | pop                 ecx
             //   33d2                 | ret                 4
             //   488bcd               | push                dword ptr [ebp - 0xc]
-            //   ff15????????         |                     
+            //   ff15????????         |
 
         $sequence_56 = { 33db 6a01 e8???????? 85db 7423 8b0d???????? }
             // n = 6, score = 1300
             //   33db                 | sbb                 eax, eax
             //   6a01                 | mov                 dword ptr [esp + 0x28], 0xea60
-            //   e8????????           |                     
+            //   e8????????           |
             //   85db                 | dec                 esp
             //   7423                 | cmovne              ecx, eax
-            //   8b0d????????         |                     
+            //   8b0d????????         |
 
         $sequence_57 = { 83c604 e8???????? 3bfb 7414 }
             // n = 4, score = 1300
             //   83c604               | mov                 ebx, 0xea60
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bfb                 | jne                 7
             //   7414                 | push                ebx
 
         $sequence_58 = { ff15???????? 3bc3 8b35???????? 8b3d???????? }
             // n = 4, score = 1300
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   3bc3                 | je                  0x13
-            //   8b35????????         |                     
-            //   8b3d????????         |                     
+            //   8b35????????         |
+            //   8b3d????????         |
 
         $sequence_59 = { 4883c608 83fd05 72c1 eb0c bb7f000000 eb05 bb7e000000 }
             // n = 7, score = 1300
@@ -540,18 +540,18 @@ rule win_isfb_auto {
         $sequence_60 = { 58 e8???????? 3bc3 7406 50 e8???????? 3bfb }
             // n = 7, score = 1300
             //   58                   | mov                 ebx, eax
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc3                 | push                ebx
             //   7406                 | push                esi
             //   50                   | pop                 ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bfb                 | cmp                 dword ptr [ebp - 4], esi
 
         $sequence_61 = { 4c8bc3 33d2 ff15???????? 488bdf 8bf7 483bdf 7508 }
             // n = 7, score = 1300
             //   4c8bc3               | push                ebx
             //   33d2                 | push                1
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   488bdf               | push                1
             //   8bf7                 | push                dword ptr [ebp + 0x14]
             //   483bdf               | mov                 edi, eax
@@ -561,7 +561,7 @@ rule win_isfb_auto {
             // n = 6, score = 1300
             //   50                   | push                ebx
             //   89450c               | cmp                 edi, esi
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   3bc3                 | push                dword ptr [ebp + 0xc]
             //   8945f4               | push                ebx
             //   741a                 | cmp                 edi, esi
@@ -570,7 +570,7 @@ rule win_isfb_auto {
             // n = 7, score = 1300
             //   85db                 | cmovne              ecx, eax
             //   7423                 | dec                 eax
-            //   8b0d????????         |                     
+            //   8b0d????????         |
             //   0fb701               | mov                 dword ptr [esp + 0x20], ebx
             //   663d6100             | test                eax, eax
             //   720e                 | mov                 dword ptr [esp + 0x28], 0xea60
@@ -581,16 +581,16 @@ rule win_isfb_auto {
             //   b90e010000           | push                0
             //   41b800000100         | push                0
             //   4889442420           | xor                 ebx, ebx
-            //   e8????????           |                     
-            //   e9????????           |                     
+            //   e8????????           |
+            //   e9????????           |
 
         $sequence_65 = { 33c0 e8???????? 3bc3 740f 8b35???????? 50 83c604 }
             // n = 7, score = 1300
             //   33c0                 | push                ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bc3                 | mov                 eax, 0x800
             //   740f                 | push                eax
-            //   8b35????????         |                     
+            //   8b35????????         |
             //   50                   | push                esi
             //   83c604               | test                byte ptr [eax + 4], 8
 
@@ -598,7 +598,7 @@ rule win_isfb_auto {
             // n = 7, score = 1300
             //   50                   | mov                 ebx, 0xea60
             //   8bd7                 | cmp                 dword ptr [ebp + 0x18], 0
-            //   e8????????           |                     
+            //   e8????????           |
             //   eb02                 | jne                 0xb
             //   33c0                 | push                ebx
             //   3bc3                 | mov                 ebx, 0xea60
@@ -609,7 +609,7 @@ rule win_isfb_auto {
             //   8bd5                 | dec                 esp
             //   488bcf               | mov                 esp, edi
             //   bb57000000           | jne                 0xffffffc9
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_68 = { 8945f4 741a ff750c 668918 68???????? ff75f8 }
             // n = 6, score = 1300
@@ -617,15 +617,15 @@ rule win_isfb_auto {
             //   741a                 | push                esi
             //   ff750c               | push                dword ptr [ebp + 0xc]
             //   668918               | push                ebx
-            //   68????????           |                     
+            //   68????????           |
             //   ff75f8               | cmp                 edi, esi
 
         $sequence_69 = { ff75fc 56 ff35???????? ff15???????? 53 56 }
             // n = 6, score = 1200
             //   ff75fc               | mov                 eax, esi
             //   56                   | je                  0xffffffa5
-            //   ff35????????         |                     
-            //   ff15????????         |                     
+            //   ff35????????         |
+            //   ff15????????         |
             //   53                   | xor                 edi, edi
             //   56                   | jmp                 0xf
 
@@ -657,20 +657,20 @@ rule win_isfb_auto {
             // n = 4, score = 1200
             //   0f854affffff         | lea                 ecx, [eax + 3]
             //   894330               | inc                 ebp
-            //   e9????????           |                     
+            //   e9????????           |
             //   55                   | xor                 eax, eax
 
         $sequence_74 = { c744242000010000 ff15???????? 4883f8ff 488bf8 7442 }
             // n = 5, score = 1200
             //   c744242000010000     | jne                 0xb
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4883f8ff             | xor                 ebx, ebx
             //   488bf8               | mov                 dword ptr [ebp + 8], ebx
             //   7442                 | jmp                 0xa
 
         $sequence_75 = { e8???????? 85c0 0f8586000000 8b4720 }
             // n = 4, score = 1200
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | dec                 ecx
             //   0f8586000000         | mov                 esi, dword ptr [ebx + 0x30]
             //   8b4720               | inc                 ecx
@@ -680,7 +680,7 @@ rule win_isfb_auto {
             //   57                   | mov                 eax, dword ptr [ebp + 0xc]
             //   ff750c               | mov                 dword ptr [eax], esi
             //   53                   | jmp                 0x37
-            //   e8????????           |                     
+            //   e8????????           |
             //   3bfe                 | push                0
             //   740e                 | xor                 edi, edi
             //   57                   | jmp                 0xd
@@ -697,14 +697,14 @@ rule win_isfb_auto {
             //   ff5214               | push                esi
             //   8bf7                 | push                ebx
             //   8bfe                 | push                esi
-            //   e8????????           |                     
+            //   e8????????           |
             //   5f                   | jne                 0x30
             //   5e                   | push                ebx
 
         $sequence_79 = { 83632800 e9???????? 8b4330 a840 0f84e2000000 }
             // n = 5, score = 1200
             //   83632800             | cmp                 dword ptr [ebp - 4], esi
-            //   e9????????           |                     
+            //   e9????????           |
             //   8b4330               | je                  0x17
             //   a840                 | push                dword ptr [ebp - 4]
             //   0f84e2000000         | push                ebx
@@ -714,14 +714,14 @@ rule win_isfb_auto {
             //   f6400408             | mov                 dword ptr [ebp - 0x10], ebx
             //   752e                 | mov                 dword ptr [ebp - 8], 0x57
             //   53                   | mov                 edi, 0x119
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_81 = { 56 ff35???????? 8945f8 ff15???????? 8bd8 3bde }
             // n = 6, score = 1200
             //   56                   | jmp                 0x3a
-            //   ff35????????         |                     
+            //   ff35????????         |
             //   8945f8               | push                0
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   8bd8                 | jne                 0x10
             //   3bde                 | cmp                 dword ptr [ebp + 8], 0
 
@@ -735,7 +735,7 @@ rule win_isfb_auto {
 
         $sequence_83 = { e8???????? 33f6 3975fc 7410 ff75fc 56 }
             // n = 6, score = 1200
-            //   e8????????           |                     
+            //   e8????????           |
             //   33f6                 | xor                 edi, edi
             //   3975fc               | jmp                 9
             //   7410                 | je                  0xa
@@ -744,50 +744,50 @@ rule win_isfb_auto {
 
         $sequence_84 = { ff15???????? 53 56 ff35???????? ff15???????? 5b 5f }
             // n = 7, score = 1200
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   53                   | push                ecx
             //   56                   | pop                 edi
-            //   ff35????????         |                     
-            //   ff15????????         |                     
+            //   ff35????????         |
+            //   ff15????????         |
             //   5b                   | ret                 4
             //   5f                   | push                ebp
 
         $sequence_85 = { 488bce ff15???????? 488b0d???????? 33d2 4c63c0 }
             // n = 5, score = 1100
             //   488bce               | inc                 ecx
-            //   ff15????????         |                     
-            //   488b0d????????       |                     
+            //   ff15????????         |
+            //   488b0d????????       |
             //   33d2                 | pop                 ebp
             //   4c63c0               | inc                 ecx
 
         $sequence_86 = { 33d2 ff15???????? 483bc3 4c8be8 }
             // n = 4, score = 1100
             //   33d2                 | push                0x122
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   483bc3               | push                dword ptr [ebp + 8]
             //   4c8be8               | push                0
 
         $sequence_87 = { 6a00 ff35???????? ff15???????? 33db 6a01 }
             // n = 5, score = 1100
             //   6a00                 | test                edi, edi
-            //   ff35????????         |                     
-            //   ff15????????         |                     
+            //   ff35????????         |
+            //   ff15????????         |
             //   33db                 | dec                 esp
             //   6a01                 | mov                 esp, edi
 
         $sequence_88 = { 48890d???????? 410fb64103 488d0cc3 48890d???????? }
             // n = 4, score = 1100
-            //   48890d????????       |                     
+            //   48890d????????       |
             //   410fb64103           | push                ebp
             //   488d0cc3             | mov                 ebp, esp
-            //   48890d????????       |                     
+            //   48890d????????       |
 
         $sequence_89 = { 48890d???????? 410fb64102 488d0cc3 48890d???????? }
             // n = 4, score = 1100
-            //   48890d????????       |                     
+            //   48890d????????       |
             //   410fb64102           | je                  0xd2
             //   488d0cc3             | test                ebx, ebx
-            //   48890d????????       |                     
+            //   48890d????????       |
 
         $sequence_90 = { 8a4b1c 488b4558 4c8b4d30 4c8b4510 }
             // n = 4, score = 1100
@@ -805,7 +805,7 @@ rule win_isfb_auto {
 
         $sequence_92 = { e8???????? 85c0 7507 33db 895d08 eb03 8b5d08 }
             // n = 7, score = 1100
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | test                eax, eax
             //   7507                 | jne                 9
             //   33db                 | xor                 ebx, ebx
@@ -816,8 +816,8 @@ rule win_isfb_auto {
         $sequence_93 = { 33d2 ff15???????? 8b05???????? 418bdd }
             // n = 4, score = 1100
             //   33d2                 | dec                 eax
-            //   ff15????????         |                     
-            //   8b05????????         |                     
+            //   ff15????????         |
+            //   8b05????????         |
             //   418bdd               | mov                 ecx, edi
 
         $sequence_94 = { 5b c9 c20400 51 56 ff74240c }
@@ -841,7 +841,7 @@ rule win_isfb_auto {
             //   33d2                 | dec                 esp
             //   498bcc               | mov                 dword ptr [ebp + ebx*8], esp
             //   498bfd               | add                 ebx, 1
-            //   e8????????           |                     
+            //   e8????????           |
             //   493bc5               | dec                 eax
             //   7405                 | test                edi, edi
             //   8b38                 | dec                 esp
@@ -850,48 +850,48 @@ rule win_isfb_auto {
             // n = 4, score = 1100
             //   4885db               | mov                 ebx, eax
             //   740c                 | test                ebx, ebx
-            //   4c8b0d????????       |                     
-            //   e9????????           |                     
+            //   4c8b0d????????       |
+            //   e9????????           |
 
         $sequence_98 = { ff15???????? 488bcf 48870d???????? 483bcf 7405 e8???????? }
             // n = 6, score = 1100
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   488bcf               | push                esi
-            //   48870d????????       |                     
+            //   48870d????????       |
             //   483bcf               | mov                 esi, ecx
             //   7405                 | add                 eax, 0xfffffefe
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_99 = { 33d2 ff15???????? 4885db 740c }
             // n = 4, score = 1100
             //   33d2                 | jne                 7
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4885db               | push                ebx
             //   740c                 | mov                 ebx, 0xea60
 
         $sequence_100 = { 745d 488b0d???????? 33d2 41b800040000 ff15???????? 4c8b4608 }
             // n = 6, score = 1100
             //   745d                 | push                eax
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   33d2                 | push                0x10
             //   41b800040000         | pop                 eax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4c8b4608             | je                  0x15
 
         $sequence_101 = { 50 57 e8???????? e9???????? 68???????? }
             // n = 5, score = 1100
             //   50                   | cmp                 dword ptr [ebp + 8], 0
             //   57                   | je                  0x10
-            //   e8????????           |                     
-            //   e9????????           |                     
-            //   68????????           |                     
+            //   e8????????           |
+            //   e9????????           |
+            //   68????????           |
 
         $sequence_102 = { 8bc3 5b c3 a1???????? 83c040 }
             // n = 5, score = 1000
             //   8bc3                 | mov                 ebp, eax
             //   5b                   | dec                 ecx
             //   c3                   | add                 eax, 0x2d
-            //   a1????????           |                     
+            //   a1????????           |
             //   83c040               | dec                 eax
 
         $sequence_103 = { 8b02 43 8acb d3c0 33c6 33442410 }
@@ -917,7 +917,7 @@ rule win_isfb_auto {
             // n = 6, score = 1000
             //   eb08                 | mov                 dword ptr [ebp + 8], ebx
             //   488bce               | jmp                 0xa
-            //   e8????????           |                     
+            //   e8????????           |
             //   488b5c2440           | test                eax, eax
             //   488b742448           | jne                 9
             //   488bc7               | xor                 ebx, ebx
@@ -940,7 +940,7 @@ rule win_isfb_auto {
             // n = 5, score = 1000
             //   53                   | push                ebx
             //   ff7614               | push                dword ptr [esi + 0x14]
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   85c0                 | test                eax, eax
             //   7512                 | jne                 0x14
 
@@ -948,14 +948,14 @@ rule win_isfb_auto {
             // n = 6, score = 1000
             //   85c0                 | test                eax, eax
             //   7512                 | jne                 0x14
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   8bf8                 | mov                 edi, eax
             //   81ffe5030000         | cmp                 edi, 0x3e5
             //   750d                 | jne                 0xf
 
         $sequence_110 = { 8b3d???????? 56 ffd7 53 56 ffd7 }
             // n = 6, score = 1000
-            //   8b3d????????         |                     
+            //   8b3d????????         |
             //   56                   | mov                 eax, dword ptr [ebp + 0x10]
             //   ffd7                 | mov                 cl, byte ptr [ebx + 0x1c]
             //   53                   | dec                 eax
@@ -977,13 +977,13 @@ rule win_isfb_auto {
             //   3bc3                 | push                0x122
             //   7fbd                 | push                dword ptr [ebp + 8]
             //   83c701               | push                0
-            //   e9????????           |                     
+            //   e9????????           |
             //   488b8424c8010000     | ret                 4
 
         $sequence_113 = { 33d2 ff15???????? 33ff 4885ff }
             // n = 4, score = 900
             //   33d2                 | dec                 eax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   33ff                 | add                 esp, 0x40
             //   4885ff               | inc                 ecx
 
@@ -991,22 +991,22 @@ rule win_isfb_auto {
             // n = 4, score = 900
             //   33c9                 | mov                 eax, dword ptr [esi]
             //   bb26040000           | mov                 ecx, dword ptr [eax]
-            //   48870d????????       |                     
+            //   48870d????????       |
             //   4885c9               | push                ebx
 
         $sequence_115 = { 41b905000000 488bd8 ff15???????? 488bcb ff15???????? 4533c9 488bd3 }
             // n = 7, score = 900
             //   41b905000000         | mov                 eax, dword ptr [esi]
             //   488bd8               | mov                 ecx, dword ptr [eax]
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   488bcb               | push                edi
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4533c9               | push                dword ptr [ebp + 0x10]
             //   488bd3               | push                dword ptr [ebp + 0xc]
 
         $sequence_116 = { ff15???????? 483bc3 488be8 0f8458010000 }
             // n = 4, score = 900
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   483bc3               | and                 dword ptr [ebp - 8], 0
             //   488be8               | ret                 4
             //   0f8458010000         | push                ebp
@@ -1016,7 +1016,7 @@ rule win_isfb_auto {
             //   483bc3               | push                ebp
             //   4c8be8               | mov                 ebp, esp
             //   0f841c010000         | sub                 esp, 0xc
-            //   448b05????????       |                     
+            //   448b05????????       |
 
         $sequence_118 = { 4533c9 4889442428 215c2420 4533c0 }
             // n = 4, score = 900
@@ -1030,7 +1030,7 @@ rule win_isfb_auto {
             //   49bb00c0692ac9000000     | mov    ebp, esp
             //   488bcf               | sub                 esp, 0xc
             //   4c019c24d8010000     | and                 dword ptr [ebp - 8], 0
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   6641b85c00           | push                edi
             //   33d2                 | pop                 ebx
 
@@ -1049,20 +1049,20 @@ rule win_isfb_auto {
             //   741d                 | je                  0x15
             //   3dd2100000           | push                eax
             //   7416                 | push                0x10
-            //   a1????????           |                     
+            //   a1????????           |
 
         $sequence_122 = { 458be0 bb08000000 e8???????? 85c0 }
             // n = 4, score = 900
             //   458be0               | mov                 ecx, dword ptr [eax]
             //   bb08000000           | push                dword ptr [ebp + 8]
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | mov                 eax, esi
 
         $sequence_123 = { 4c8be0 0f8583000000 488b0d???????? 4d8bc5 33d2 }
             // n = 5, score = 900
             //   4c8be0               | push                0x122
             //   0f8583000000         | push                dword ptr [ebp + 8]
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   4d8bc5               | push                0
             //   33d2                 | push                0
 
@@ -1074,11 +1074,11 @@ rule win_isfb_auto {
             //   33ff                 | je                  0x15
             //   ff7508               | push                dword ptr [ebp - 4]
             //   217dfc               | push                esi
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_125 = { ff35???????? ffd3 8bd8 85db 7476 }
             // n = 5, score = 900
-            //   ff35????????         |                     
+            //   ff35????????         |
             //   ffd3                 | je                  0x19
             //   8bd8                 | push                eax
             //   85db                 | push                0x10
@@ -1087,15 +1087,15 @@ rule win_isfb_auto {
         $sequence_126 = { 7416 a1???????? 83c004 50 be???????? }
             // n = 5, score = 900
             //   7416                 | je                  0x15
-            //   a1????????           |                     
+            //   a1????????           |
             //   83c004               | push                eax
             //   50                   | push                0x10
-            //   be????????           |                     
+            //   be????????           |
 
         $sequence_127 = { 488bce ff15???????? 4c8d4c2450 4c8d442458 }
             // n = 4, score = 900
             //   488bce               | pop                 esi
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   4c8d4c2450           | inc                 ecx
             //   4c8d442458           | pop                 ebp
 
@@ -1104,14 +1104,14 @@ rule win_isfb_auto {
             //   4c8d442458           | pop                 esi
             //   8d5001               | pop                 ebp
             //   488bce               | pop                 ebx
-            //   e8????????           |                     
+            //   e8????????           |
 
         $sequence_129 = { 488bd6 ff15???????? eb14 488b0d???????? 4c8bc7 33d2 }
             // n = 6, score = 900
             //   488bd6               | pop                 esp
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   eb14                 | pop                 edi
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   4c8bc7               | mov                 esi, 1
             //   33d2                 | mov                 eax, esi
 
@@ -1120,13 +1120,13 @@ rule win_isfb_auto {
             //   41be01000000         | and                 dword ptr [esp + 0x20], ebx
             //   33c9                 | inc                 ebp
             //   418bd6               | xor                 ecx, ecx
-            //   ff15????????         |                     
+            //   ff15????????         |
 
         $sequence_131 = { 448b05???????? 8b0d???????? 8b05???????? 410fc9 }
             // n = 4, score = 800
-            //   448b05????????       |                     
-            //   8b0d????????         |                     
-            //   8b05????????         |                     
+            //   448b05????????       |
+            //   8b0d????????         |
+            //   8b05????????         |
             //   410fc9               | xor                 edx, edx
 
         $sequence_132 = { 4c63c0 33d2 4983c00c ff15???????? }
@@ -1134,7 +1134,7 @@ rule win_isfb_auto {
             //   4c63c0               | add                 esp, 0x40
             //   33d2                 | inc                 ecx
             //   4983c00c             | pop                 esi
-            //   ff15????????         |                     
+            //   ff15????????         |
 
         $sequence_133 = { 53 56 8bf1 05fefeffff }
             // n = 4, score = 800
@@ -1146,9 +1146,9 @@ rule win_isfb_auto {
         $sequence_134 = { 6a03 8935???????? 8935???????? 8935???????? }
             // n = 4, score = 800
             //   6a03                 | xor                 eax, dword ptr [esp + 0x10]
-            //   8935????????         |                     
-            //   8935????????         |                     
-            //   8935????????         |                     
+            //   8935????????         |
+            //   8935????????         |
+            //   8935????????         |
 
         $sequence_135 = { 803f2a 750b 4883c701 83c3ff }
             // n = 4, score = 800
@@ -1159,8 +1159,8 @@ rule win_isfb_auto {
 
         $sequence_136 = { ff15???????? 488b0d???????? 448bc0 8bd8 33d2 4983c001 }
             // n = 6, score = 800
-            //   ff15????????         |                     
-            //   488b0d????????       |                     
+            //   ff15????????         |
+            //   488b0d????????       |
             //   448bc0               | mov                 ecx, 0x10e
             //   8bd8                 | inc                 ecx
             //   33d2                 | mov                 eax, 0x10000
@@ -1168,16 +1168,16 @@ rule win_isfb_auto {
 
         $sequence_137 = { a1???????? 25efff0000 0bc2 e9???????? }
             // n = 4, score = 800
-            //   a1????????           |                     
+            //   a1????????           |
             //   25efff0000           | mov                 esi, eax
             //   0bc2                 | mov                 dword ptr [edx], esi
-            //   e9????????           |                     
+            //   e9????????           |
 
         $sequence_138 = { e9???????? 488bcb ff15???????? a810 }
             // n = 4, score = 800
-            //   e9????????           |                     
+            //   e9????????           |
             //   488bcb               | arpl                ax, ax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   a810                 | xor                 edx, edx
 
         $sequence_139 = { 4533c9 4533c0 33d2 ff15???????? 85c0 7511 ff15???????? }
@@ -1185,10 +1185,10 @@ rule win_isfb_auto {
             //   4533c9               | add                 eax, 0xc
             //   4533c0               | dec                 esp
             //   33d2                 | arpl                ax, ax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   85c0                 | xor                 edx, edx
             //   7511                 | dec                 ecx
-            //   ff15????????         |                     
+            //   ff15????????         |
 
         $sequence_140 = { 57 895df4 895df0 c745f857000000 }
             // n = 4, score = 800
@@ -1201,7 +1201,7 @@ rule win_isfb_auto {
             // n = 6, score = 700
             //   53                   | xor                 eax, esi
             //   8bc7                 | xor                 eax, dword ptr [esp + 0x10]
-            //   e8????????           |                     
+            //   e8????????           |
             //   8d4618               | add                 edx, 4
             //   8b08                 | dec                 dword ptr [esp + 0xc]
             //   50                   | jne                 0xffffffec
@@ -1210,9 +1210,9 @@ rule win_isfb_auto {
             // n = 7, score = 700
             //   750a                 | xor                 edx, edx
             //   488bcf               | inc                 ecx
-            //   e8????????           |                     
+            //   e8????????           |
             //   8bd8                 | mov                 esi, 1
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   4c8bc7               | xor                 ecx, ecx
             //   33d2                 | inc                 ecx
 
@@ -1246,7 +1246,7 @@ rule win_isfb_auto {
             // n = 6, score = 700
             //   488d542438           | push                eax
             //   488bcb               | add                 esi, 4
-            //   e8????????           |                     
+            //   e8????????           |
             //   eb02                 | cmp                 edi, ebx
             //   33c0                 | je                  8
             //   85c0                 | push                eax
@@ -1263,7 +1263,7 @@ rule win_isfb_auto {
 
         $sequence_148 = { 488b0d???????? 4889040f 4883c708 492bf6 }
             // n = 4, score = 700
-            //   488b0d????????       |                     
+            //   488b0d????????       |
             //   4889040f             | mov                 esi, 1
             //   4883c708             | xor                 ecx, ecx
             //   492bf6               | inc                 ecx
@@ -1272,7 +1272,7 @@ rule win_isfb_auto {
             // n = 7, score = 700
             //   ff7508               | pop                 esi
             //   8bc6                 | pop                 ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   8b06                 | mov                 eax, dword ptr [edx]
             //   8b08                 | inc                 ebx
             //   57                   | mov                 cl, bl
@@ -1291,7 +1291,7 @@ rule win_isfb_auto {
         $sequence_151 = { 33d2 ff15???????? 83bc241002000000 7416 488d942410020000 4c8bcf 458bc4 }
             // n = 7, score = 600
             //   33d2                 | je                  0x11
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   83bc241002000000     | push                eax
             //   7416                 | add                 esi, 4
             //   488d942410020000     | cmp                 edi, ebx
@@ -1302,7 +1302,7 @@ rule win_isfb_auto {
             // n = 4, score = 600
             //   21b42410020000       | cmp                 edi, ebx
             //   eb0d                 | je                  0x1b
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   89842410020000       | cmp                 eax, ebx
 
         $sequence_153 = { 488b8c2428020000 488364242000 448d4803 4533c0 }
@@ -1318,7 +1318,7 @@ rule win_isfb_auto {
             //   448d4803             | jmp                 6
             //   4533c0               | xor                 eax, eax
             //   488bd3               | cmp                 eax, ebx
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   488b8c2428020000     | je                  0x25
             //   8bf0                 | cmp                 eax, ebx
 
@@ -1333,16 +1333,16 @@ rule win_isfb_auto {
         $sequence_156 = { 418bcd e8???????? 8b842410020000 4c8d9c24f0010000 }
             // n = 4, score = 600
             //   418bcd               | cmp                 edi, ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   8b842410020000       | je                  0x19
             //   4c8d9c24f0010000     | je                  0x11
 
         $sequence_157 = { 488bcb ff15???????? 8bc8 ff15???????? 21b42410020000 }
             // n = 5, score = 600
             //   488bcb               | push                ebp
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   8bc8                 | xor                 eax, eax
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   21b42410020000       | cmp                 eax, edi
 
         $sequence_158 = { 33c0 ebe3 55 8bec 83ec18 53 56 }
@@ -1368,18 +1368,18 @@ rule win_isfb_auto {
             //   397b44               | push                esi
             //   7510                 | push                edi
             //   488b0b               | xor                 edi, edi
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | mov                 ebp, esp
             //   0f859b000000         | sub                 esp, 0x48
 
         $sequence_161 = { e8???????? 488b0d???????? 4c8bc3 33d2 ff15???????? 488b0d???????? 4c8bc7 }
             // n = 7, score = 500
-            //   e8????????           |                     
-            //   488b0d????????       |                     
+            //   e8????????           |
+            //   488b0d????????       |
             //   4c8bc3               | push                eax
             //   33d2                 | cmp                 eax, edi
-            //   ff15????????         |                     
-            //   488b0d????????       |                     
+            //   ff15????????         |
+            //   488b0d????????       |
             //   4c8bc7               | je                  0x1d
 
         $sequence_162 = { eb0b 8b434c 84c0 0f89a3000000 8b434c a804 7415 }
@@ -1398,7 +1398,7 @@ rule win_isfb_auto {
             //   a801                 | je                  0x16
             //   742c                 | cmp                 eax, ebx
             //   488b0b               | je                  0xa
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | push                eax
             //   0f85e8000000         | cmp                 edi, ebx
 
@@ -1407,14 +1407,14 @@ rule win_isfb_auto {
             //   4533c0               | push                eax
             //   33db                 | xor                 eax, eax
             //   89442430             | cmp                 eax, edi
-            //   e8????????           |                     
+            //   e8????????           |
             //   483bc3               | je                  0x15
-            //   488905????????       |                     
+            //   488905????????       |
             //   0f84b9020000         | xor                 eax, eax
 
         $sequence_165 = { 488905???????? 0f8431020000 817424302083b8ed 8d7b01 }
             // n = 4, score = 500
-            //   488905????????       |                     
+            //   488905????????       |
             //   0f8431020000         | push                eax
             //   817424302083b8ed     | xor                 eax, eax
             //   8d7b01               | cmp                 eax, edi
@@ -1428,17 +1428,17 @@ rule win_isfb_auto {
 
         $sequence_167 = { e9???????? 488d942498000000 488d4c2430 4889442420 e8???????? 85c0 7574 }
             // n = 7, score = 500
-            //   e9????????           |                     
+            //   e9????????           |
             //   488d942498000000     | inc                 ecx
             //   488d4c2430           | push                esp
             //   4889442420           | inc                 ecx
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | push                ebp
             //   7574                 | inc                 ecx
 
         $sequence_168 = { e8???????? 85c0 0f859b000000 4863533c 488b4608 488b0e 48035334 }
             // n = 7, score = 500
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | cmp                 eax, ebx
             //   0f859b000000         | je                  0x23
             //   4863533c             | cmp                 edi, ebx
@@ -1451,14 +1451,14 @@ rule win_isfb_auto {
             //   4c8d40cc             | mov                 esp, ebx
             //   33d2                 | dec                 eax
             //   33c9                 | mov                 edx, ebx
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | dec                 eax
             //   0f8561010000         | mov                 ecx, dword ptr [esp + 0x228]
             //   8b4348               | mov                 esi, eax
 
         $sequence_170 = { e8???????? 85c0 0f85e8000000 488b4608 488b0e 4533c9 448bc5 }
             // n = 7, score = 500
-            //   e8????????           |                     
+            //   e8????????           |
             //   85c0                 | sub                 esp, 0x1f0
             //   0f85e8000000         | xor                 esi, esi
             //   488b4608             | xor                 eax, eax
@@ -1479,13 +1479,13 @@ rule win_isfb_auto {
             //   89442428             | jb                  0xffffffc6
             //   488b842410020000     | jmp                 0x13
             //   4889442420           | mov                 ebx, 0x7f
-            //   e8????????           |                     
+            //   e8????????           |
             //   8bd8                 | jmp                 0x13
 
         $sequence_173 = { 4533c0 ff15???????? 8bd8 83f801 }
             // n = 4, score = 400
             //   4533c0               | add                 ebp, esi
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   8bd8                 | dec                 eax
             //   83f801               | add                 esi, 8
 
@@ -1495,21 +1495,21 @@ rule win_isfb_auto {
             //   7427                 | jb                  0xffffffc3
             //   488d542420           | jmp                 0x10
             //   b901020000           | mov                 ebx, 0x7f
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   85c0                 | jmp                 0x10
 
         $sequence_175 = { ba10000000 488bc8 e8???????? 48898424e0010000 4885c0 }
             // n = 5, score = 400
             //   ba10000000           | dec                 eax
             //   488bc8               | add                 esi, 8
-            //   e8????????           |                     
+            //   e8????????           |
             //   48898424e0010000     | cmp                 ebp, 5
             //   4885c0               | jb                  0xffffffc3
 
         $sequence_176 = { 488d542440 e8???????? 8bd8 85c0 7541 }
             // n = 5, score = 400
             //   488d542440           | dec                 ecx
-            //   e8????????           |                     
+            //   e8????????           |
             //   8bd8                 | mov                 ecx, esp
             //   85c0                 | dec                 ecx
             //   7541                 | mov                 edi, ebp
@@ -1520,13 +1520,13 @@ rule win_isfb_auto {
             //   4885c0               | inc                 ecx
             //   7508                 | add                 ebp, esi
             //   8d5f08               | dec                 eax
-            //   e9????????           |                     
+            //   e9????????           |
             //   8b842420020000       | add                 esi, 8
 
         $sequence_178 = { 4c89642448 ff15???????? 8bd8 83f8ff }
             // n = 4, score = 400
             //   4c89642448           | mov                 ebx, 0x7e
-            //   ff15????????         |                     
+            //   ff15????????         |
             //   8bd8                 | dec                 eax
             //   83f8ff               | add                 esi, 8
 
@@ -1603,5 +1603,5 @@ rule win_isfb_auto {
             //   5b                   | lea                 ecx, [eax + 1]
 
     condition:
-        7 of them and filesize &lt; 2940928
+        7 of them and filesize < 2940928
 }

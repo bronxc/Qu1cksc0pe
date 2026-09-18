@@ -1,7 +1,7 @@
 """
 windows_api_hooker.py
 ---------------------
-Frida-free Windows API interceptor using the Windows Debug API (x64 only).
+Frida-free Windows API interceptor using the Windows Debug API (x64 and WOW64).
 
 Strategy:
   1. Enable SeDebugPrivilege so we can attach to any user-owned process.
@@ -10,9 +10,9 @@ Strategy:
      for every API that can be resolved right now.
   4. On LOAD_DLL_DEBUG_EVENT, retry APIs whose DLL was not yet loaded.
   5. On subsequent EXCEPTION_BREAKPOINT (our hooks):
-       - read argument registers (RCX/RDX/R8/R9 + stack)
+       - read x64 argument registers/stack or the WOW64 x86 stack
        - fire the callback
-       - restore the original byte, rewind RIP, set TRAP_FLAG
+       - restore the original byte, rewind RIP/EIP, set TRAP_FLAG
        - single-step -> EXCEPTION_SINGLE_STEP -> re-install INT3
   6. On EXIT_PROCESS, stop the loop and detach.
 
@@ -28,7 +28,7 @@ Public interface
 
 Limitations
 ~~~~~~~~~~~
-  * Python and target MUST both be 64-bit.
+  * Python must be 64-bit; targets may be x64 or x86 running under WOW64.
   * A process can have only one debugger at a time.
   * Processes protected by ACG (e.g. Chrome GPU/renderer) block WriteProcessMemory
     on code pages -- those hooks will appear in `failed` with reason "write_failed".
@@ -38,6 +38,11 @@ import ctypes
 import ctypes.wintypes as W
 import struct
 import threading
+import os
+import ipaddress
+import time
+from windows_injection import INJECTION_APIS, capture_api_event
+from windows_process_reader import filetime_to_unix
 
 kernel32  = ctypes.WinDLL("kernel32",  use_last_error=True)
 advapi32  = ctypes.WinDLL("advapi32",  use_last_error=True)
@@ -58,6 +63,8 @@ kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
 
 kernel32.LoadLibraryW.restype  = _vp
 kernel32.LoadLibraryW.argtypes = [ctypes.c_wchar_p]
+kernel32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, _vp, _dw]
+kernel32.LoadLibraryExW.restype = _vp
 
 kernel32.GetProcAddress.restype  = _vp
 kernel32.GetProcAddress.argtypes = [_vp, ctypes.c_char_p]
@@ -76,6 +83,8 @@ kernel32.VirtualFree.restype  = _b
 
 kernel32.GetCurrentProcess.restype  = _vp
 kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetProcessTimes.argtypes = [_vp, _vp, _vp, _vp, _vp]
+kernel32.GetProcessTimes.restype = _b
 
 kernel32.CloseHandle.restype  = _b
 kernel32.CloseHandle.argtypes = [_vp]
@@ -91,6 +100,10 @@ kernel32.GetThreadContext.argtypes = [_vp, _vp]
 
 kernel32.SetThreadContext.restype  = _b
 kernel32.SetThreadContext.argtypes = [_vp, _vp]
+kernel32.Wow64GetThreadContext.restype = _b
+kernel32.Wow64GetThreadContext.argtypes = [_vp, _vp]
+kernel32.Wow64SetThreadContext.restype = _b
+kernel32.Wow64SetThreadContext.argtypes = [_vp, _vp]
 
 # WaitForDebugEvent argtypes set after DEBUG_EVENT is defined (see below)
 kernel32.WaitForDebugEvent.restype  = _b
@@ -106,6 +119,12 @@ kernel32.DebugActiveProcessStop.argtypes = [_dw]
 
 kernel32.DebugSetProcessKillOnExit.restype  = _b
 kernel32.DebugSetProcessKillOnExit.argtypes = [_b]
+kernel32.DebugBreakProcess.argtypes = [_vp]
+kernel32.DebugBreakProcess.restype = _b
+kernel32.FlushInstructionCache.argtypes = [_vp, _vp, _sz]
+kernel32.FlushInstructionCache.restype = _b
+kernel32.IsWow64Process.argtypes = [_vp, ctypes.POINTER(W.BOOL)]
+kernel32.IsWow64Process.restype = _b
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 EXCEPTION_DEBUG_EVENT      = 1
@@ -119,6 +138,8 @@ OUTPUT_DEBUG_STRING_EVENT  = 8
 
 EXCEPTION_BREAKPOINT  = 0x80000003
 EXCEPTION_SINGLE_STEP = 0x80000004
+STATUS_WX86_BREAKPOINT = 0x4000001F
+STATUS_WX86_SINGLE_STEP = 0x4000001E
 
 DBG_CONTINUE              = 0x00010002
 DBG_EXCEPTION_NOT_HANDLED = 0x80010001
@@ -156,6 +177,11 @@ class LUID_AND_ATTRIBUTES(ctypes.Structure):
 class TOKEN_PRIVILEGES(ctypes.Structure):
     _fields_ = [("PrivilegeCount", W.DWORD),
                 ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+advapi32.LookupPrivilegeValueW.argtypes = [W.LPCWSTR, W.LPCWSTR, ctypes.POINTER(LUID)]
+advapi32.AdjustTokenPrivileges.argtypes = [W.HANDLE, W.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                         W.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+advapi32.AdjustTokenPrivileges.restype = W.BOOL
 
 class EXCEPTION_RECORD(ctypes.Structure):
     pass
@@ -332,7 +358,7 @@ def _enable_sedebug() -> bool:
             ctypes.sizeof(tp), None, None,
         )
         kernel32.CloseHandle(h_token)
-        return bool(ok)
+        return bool(ok) and ctypes.get_last_error() != 1300  # ERROR_NOT_ALL_ASSIGNED
     except Exception:
         return False
 
@@ -370,8 +396,56 @@ _API_TO_DLL = {
     "InternetOpen":       "wininet",  "InternetOpenA":     "wininet",
     "InternetReadFile":   "wininet",  "InternetRead":      "wininet",
 }
+for _dll, _names in {
+    "ntdll": "NtCreateFile NtReadFile NtWriteFile NtOpenKey NtOpenKeyEx NtCreateKey NtSetValueKey NtCreateSection NtMapViewOfSection",
+    "ws2_32": "send recv WSASend WSARecv",
+    "kernel32": "CreateDirectoryW CreateDirectoryA DeleteFileW DeleteFileA MoveFileExW LoadLibraryW CreateMutexW OutputDebugStringW",
+    "advapi32": "RegCreateKeyExW RegCreateKeyExA RegSetValueExW RegSetValueExA",
+    "wininet": "InternetOpenW InternetConnectW InternetConnectA InternetOpenUrlW InternetOpenUrlA HttpOpenRequestW HttpOpenRequestA",
+    "winhttp": "WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReadData",
+}.items():
+    _API_TO_DLL.update(dict.fromkeys(_names.split(), _dll))
+
+_API_ALIASES = {"RegKeyOpen": "RegOpenKeyExW", "InternetRead": "InternetReadFile"}
+for _api in INJECTION_APIS:
+    _API_TO_DLL[_api] = 'ntdll' if _api.startswith('Nt') else 'kernel32'
 
 # ── Lookup helpers ─────────────────────────────────────────────────────────────
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", W.DWORD), ("th32ModuleID", W.DWORD),
+                ("th32ProcessID", W.DWORD), ("GlblcntUsage", W.DWORD),
+                ("ProccntUsage", W.DWORD), ("modBaseAddr", ctypes.c_void_p),
+                ("modBaseSize", W.DWORD), ("hModule", W.HMODULE),
+                ("szModule", W.WCHAR * 256), ("szExePath", W.WCHAR * 260)]
+
+kernel32.CreateToolhelp32Snapshot.argtypes = [W.DWORD, W.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = W.HANDLE
+kernel32.Module32FirstW.argtypes = [W.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32FirstW.restype = W.BOOL
+kernel32.Module32NextW.argtypes = [W.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32NextW.restype = W.BOOL
+
+
+def _process_modules(pid, wow64=False):
+    handle = kernel32.CreateToolhelp32Snapshot(0x18 if wow64 else 0x08, pid)
+    if handle == ctypes.c_void_p(-1).value:
+        return []
+    result = []
+    try:
+        entry = MODULEENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Module32FirstW(handle, ctypes.byref(entry))
+        while ok:
+            result.append((entry.szExePath, entry.modBaseAddr, entry.modBaseSize))
+            ok = kernel32.Module32NextW(handle, ctypes.byref(entry))
+        return result
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _module_containing(pid, address):
+    return next((m for m in _process_modules(pid) if m[1] <= address < m[1] + m[2]), None)
 
 _VK_NAMES = {
     0x08: "BACKSPACE", 0x09: "TAB",   0x0D: "ENTER",   0x10: "SHIFT",
@@ -416,16 +490,38 @@ def _hkey_name(val: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+class WOW64_CONTEXT(ctypes.Structure):
+    # winnt.h: DWORDs and the 112-byte WOW64_FLOATING_SAVE_AREA; no native pointers.
+    _fields_ = ([(name, W.DWORD) for name in
+                 'ContextFlags Dr0 Dr1 Dr2 Dr3 Dr6 Dr7'.split()] +
+                [('FloatSave', ctypes.c_byte * 112)] +
+                [(name, W.DWORD) for name in
+                 'SegGs SegFs SegEs SegDs Edi Esi Ebx Edx Ecx Eax Ebp Eip SegCs EFlags Esp SegSs'.split()] +
+                [('ExtendedRegisters', ctypes.c_byte * 512)])
+
+    @property
+    def Rip(self):
+        return self.Eip
+
+    @Rip.setter
+    def Rip(self, value):
+        self.Eip = value
+
+
 class WindowsAPIHooker:
     """
-    Attaches to a 64-bit Windows process and intercepts Windows API calls
+    Attaches to an x64 or WOW64 Windows process and intercepts Windows API calls
     using INT3 software breakpoints via the Windows Debug API.
     """
 
-    def __init__(self, pid: int, api_list: list, callback):
+    def __init__(self, pid: int, api_list: list, callback, event_callback=None, expected_birth=None):
         self.pid      = pid
+        self.expected_birth = expected_birth
         self.api_list = [a for a in api_list if a.strip() and a in _API_TO_DLL]
         self.callback = callback
+        self.event_callback = event_callback
+        self.event_errors = []
+        self._dup_ph = None
 
         # Public status (populated during run, thread-safe via GIL for list.append)
         self.hooked:       list = []
@@ -433,6 +529,8 @@ class WindowsAPIHooker:
         self.attach_error: str | None  = None   # set if DebugActiveProcess fails
         self.loop_error:   str | None  = None   # set if debug loop crashes
         self.ready:        bool        = False  # True once initial bp handled
+        self.exceptions = []
+        self.exit_code = None
 
         # Internal state
         self._bp:         dict = {}   # addr -> {api, orig}
@@ -442,6 +540,18 @@ class WindowsAPIHooker:
         self._ctx_buf:    int | None = None
         self._running:    bool = False
         self._thread:     threading.Thread | None = None
+        self._stop_requested = threading.Event()
+        self._break_requested = False
+        self._resolved_exports = {}
+        self._export_rvas = {}
+        self._target_modules = {}
+        self._wow64 = False
+        self.architecture = 'unknown'
+        self._remote_export_cache = {}
+        self._api_addresses = {}
+        self.api_call_count = 0
+        self.debug_event_count = 0
+        self.phase = "not_started"
 
     # ── Memory helpers ─────────────────────────────────────────────────────────
 
@@ -453,7 +563,7 @@ class WindowsAPIHooker:
         ok   = kernel32.ReadProcessMemory(
             self._ph, ctypes.c_void_p(addr), buf, size, ctypes.byref(read)
         )
-        return buf.raw[: read.value] if (ok and read.value) else None
+        return buf.raw[: read.value] if read.value else None
 
     def _write_mem(self, addr: int, data: bytes) -> bool:
         buf     = ctypes.create_string_buffer(data)
@@ -496,98 +606,239 @@ class WindowsAPIHooker:
             return f"{ip}:{port}"
         if family == 23:
             port = struct.unpack_from(">H", raw, 2)[0]
-            return f"[IPv6]:{port}"
+            raw6 = self._read_mem(ptr, 28)
+            if raw6 and len(raw6) >= 24:
+                return f"[{ipaddress.IPv6Address(raw6[8:24])}]:{port}"
+            return f"[IPv6 unreadable]:{port}"
         return f"family:{family}"
 
     # ── Breakpoint management ──────────────────────────────────────────────────
 
     def _install_bp(self, addr: int, api_name: str) -> bool:
+        # Export aliases can share an address. Never save our own INT3 as the
+        # original instruction (this otherwise causes an endless breakpoint).
+        if addr in self._bp:
+            return True
         orig = self._read_mem(addr, 1)
         if orig is None:
             return False
         if not self._write_mem(addr, b"\xCC"):
             return False
         self._bp[addr] = {"api": api_name, "orig": orig}
+        kernel32.FlushInstructionCache(self._ph, addr, 1)
         return True
 
     def _restore_bp(self, addr: int):
         info = self._bp.get(addr)
         if info:
             self._write_mem(addr, info["orig"])
+            kernel32.FlushInstructionCache(self._ph, addr, 1)
 
     def _reinstall_bp(self, addr: int):
         if addr in self._bp:
             self._write_mem(addr, b"\xCC")
+            kernel32.FlushInstructionCache(self._ph, addr, 1)
 
     # ── API address resolution ─────────────────────────────────────────────────
 
     def _resolve_in_local(self, api_name: str) -> int:
-        """
-        GetProcAddress in our own process.
-        System DLLs share VAs across all processes in the same boot session,
-        so this gives the correct address in the target process.
-        Tries exact name, then +W, then +A suffixes.
-        """
-        dll_name = _API_TO_DLL.get(api_name)
-        if not dll_name:
+        """Translate a cached export RVA through the target's module map."""
+        if self._wow64:
+            export = _API_ALIASES.get(api_name, api_name)
+            for candidate in (export, export + 'W', export + 'A'):
+                address = self._resolve_remote_export(_API_TO_DLL[api_name] + '.dll', candidate)
+                if address:
+                    self._resolved_exports[api_name] = candidate
+                    return address
             return 0
-        hmod = kernel32.GetModuleHandleW(dll_name + ".dll")
-        if not hmod:
-            hmod = kernel32.LoadLibraryW(dll_name + ".dll")
-        if not hmod:
-            return 0
-        for candidate in (api_name, api_name + "W", api_name + "A"):
-            addr = kernel32.GetProcAddress(hmod, candidate.encode())
-            if addr:
-                return addr
+        info = self._export_rvas.get(api_name)
+        if info:
+            name, rva = info
+            remote = self._target_modules.get(name)
+            if remote and rva < remote[1]:
+                return remote[0] + rva
         return 0
+
+    def _remote_exports(self, base, size):
+        """Read bounded PE32 export tables from the target, never load its DLLs locally."""
+        key = (base, size)
+        if key in self._remote_export_cache:
+            return self._remote_export_cache[key]
+
+        def read(rva, count):
+            if rva < 0 or count < 0 or count > 4 * 1024 * 1024 or rva + count > size:
+                raise ValueError('Export range outside image')
+            raw = self._read_mem(base + rva, count)
+            if raw is None or len(raw) != count:
+                raise ValueError('Unreadable export range')
+            return raw
+
+        try:
+            dos = read(0, 64)
+            if dos[:2] != b'MZ':
+                return {}
+            pe = read(struct.unpack_from('<I', dos, 60)[0], 128)
+            if pe[:4] != b'PE\0\0' or struct.unpack_from('<H', pe, 4)[0] != 0x14c:
+                return {}
+            if struct.unpack_from('<H', pe, 24)[0] != 0x10b:
+                return {}
+            rva, length = struct.unpack_from('<II', pe, 120)
+            if not rva or length < 40:
+                return {}
+            blob = read(rva, length)
+            ordinal_base, count, names, funcs_rva, names_rva, ords_rva = struct.unpack_from('<6I', blob, 16)
+            if count > 65536 or names > 65536:
+                return {}
+            funcs = read(funcs_rva, count * 4) if count else b''
+            name_table = read(names_rva, names * 4) if names else b''
+            ords = read(ords_rva, names * 2) if names else b''
+
+            def string(at):
+                if rva <= at < rva + length:
+                    raw = blob[at - rva:at - rva + 256]
+                else:
+                    raw = read(at, min(256, size - at))
+                if b'\0' not in raw:
+                    raise ValueError('Unterminated export name')
+                return raw.split(b'\0', 1)[0].decode('ascii')
+
+            exports = {}
+            for index in range(count):
+                target = struct.unpack_from('<I', funcs, index * 4)[0]
+                if not target or target >= size:
+                    continue
+                exports['#' + str(ordinal_base + index)] = (
+                    string(target) if rva <= target < rva + length else base + target)
+            for index in range(names):
+                ordinal = struct.unpack_from('<H', ords, index * 2)[0]
+                if ordinal < count:
+                    value = exports.get('#' + str(ordinal_base + ordinal))
+                    if value:
+                        exports[string(struct.unpack_from('<I', name_table, index * 4)[0])] = value
+            self._remote_export_cache[key] = exports
+            return exports
+        except (ValueError, UnicodeError, struct.error):
+            return {}
+
+    def _resolve_remote_export(self, dll, export, seen=None):
+        seen = set() if seen is None else seen
+        key = (dll.casefold(), export)
+        if key in seen or len(seen) >= 8:
+            return 0
+        seen.add(key)
+        # WOW64 has both native and PE32 ntdll images. The PE32 header check
+        # selects the correct export table, regardless of enumeration order.
+        value = None
+        for path, module in self._target_modules.items():
+            if os.path.basename(path) == dll.casefold():
+                value = self._remote_exports(*module).get(export)
+                if value:
+                    break
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and '.' in value:
+            owner, name = value.rsplit('.', 1)
+            return self._resolve_remote_export(owner + '.dll', name, seen)
+        return 0
+
+    def _prepare_exports(self):
+        addresses = {}
+        for api in self.api_list:
+            dll = _API_TO_DLL[api] + ".dll"
+            hmod = kernel32.GetModuleHandleW(dll) or kernel32.LoadLibraryExW(dll, None, 0x800)
+            if not hmod:
+                continue
+            export = _API_ALIASES.get(api, api)
+            for candidate in (export, export + "W", export + "A"):
+                address = kernel32.GetProcAddress(hmod, candidate.encode())
+                if address:
+                    addresses[api] = address
+                    self._resolved_exports[api] = candidate
+                    break
+        # Enumerate once, rather than twice per API per initial LOAD_DLL event.
+        modules = _process_modules(os.getpid())
+        for api, address in addresses.items():
+            owner = next((m for m in modules if m[1] <= address < m[1] + m[2]), None)
+            if owner:
+                self._export_rvas[api] = (owner[0].casefold(), address - owner[1])
 
     # ── CONTEXT management ─────────────────────────────────────────────────────
 
-    def _get_context(self, thread_handle: int) -> CONTEXT | None:
-        ctx = CONTEXT.from_address(self._ctx_buf)
-        ctx.ContextFlags = CONTEXT_FULL
-        if kernel32.GetThreadContext(thread_handle, ctypes.c_void_p(self._ctx_buf)):
+    def _get_context(self, thread_handle: int) -> CONTEXT | WOW64_CONTEXT | None:
+        ctx = (WOW64_CONTEXT if self._wow64 else CONTEXT).from_address(self._ctx_buf)
+        ctx.ContextFlags = 0x10007 if self._wow64 else CONTEXT_FULL
+        getter = kernel32.Wow64GetThreadContext if self._wow64 else kernel32.GetThreadContext
+        if getter(thread_handle, ctypes.c_void_p(self._ctx_buf)):
             return ctx
         return None
 
     def _set_context(self, thread_handle: int):
-        kernel32.SetThreadContext(thread_handle, ctypes.c_void_p(self._ctx_buf))
+        setter = kernel32.Wow64SetThreadContext if self._wow64 else kernel32.SetThreadContext
+        return setter(thread_handle, ctypes.c_void_p(self._ctx_buf))
 
     # ── Argument extraction ────────────────────────────────────────────────────
 
-    def _extract_args(self, api_name: str, ctx: CONTEXT) -> str:
-        rcx, rdx, r8, r9 = ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9
+    def _argument(self, ctx, n):
+        if self._wow64:
+            address,size = ctx.Esp+n*4,4
+        elif n <= 4:
+            return (ctx.Rcx,ctx.Rdx,ctx.R8,ctx.R9)[n-1]
+        else:
+            address,size = ctx.Rsp+0x20+(n-4)*8,8
+        raw = self._read_mem(address,size)
+        return int.from_bytes(raw,'little') if raw and len(raw)==size else 0
 
+    def _extract_args(self, api_name: str, ctx: CONTEXT | WOW64_CONTEXT) -> str:
         def stack_arg(n: int) -> int:
+            if self._wow64:
+                raw = self._read_mem(ctx.Esp + n * 4, 4)
+                return struct.unpack_from('<I', raw)[0] if raw and len(raw) == 4 else 0
             raw = self._read_mem(ctx.Rsp + 0x20 + (n - 4) * 8, 8)
             return struct.unpack_from("<Q", raw)[0] if raw and len(raw) == 8 else 0
+
+        rcx, rdx, r8, r9 = ([stack_arg(n) for n in range(1, 5)] if self._wow64
+                            else (ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9))
+        pointer_size = 4 if self._wow64 else 8
+        pointer_format = '<I' if self._wow64 else '<Q'
+
+        def pointer(at):
+            raw = self._read_mem(at, pointer_size)
+            return struct.unpack_from(pointer_format, raw)[0] if raw and len(raw) == pointer_size else 0
 
         def oa_name(oa_ptr: int) -> str:
             if not oa_ptr:
                 return ""
-            uni_raw = self._read_mem(oa_ptr + 16, 8)
-            if not uni_raw:
-                return ""
-            uni_ptr = struct.unpack_from("<Q", uni_raw)[0]
+            uni_ptr = pointer(oa_ptr + pointer_size * 2)
             if not uni_ptr:
                 return ""
-            buf_raw = self._read_mem(uni_ptr + 8, 8)
-            if not buf_raw:
-                return ""
-            buf_ptr = struct.unpack_from("<Q", buf_raw)[0]
+            buf_ptr = pointer(uni_ptr + pointer_size)
             return self._read_str(buf_ptr, wide=True)
 
         a = api_name
+        if a in INJECTION_APIS and a != 'NtMapViewOfSection':
+            return ' '.join(f'arg{n}:0x{self._argument(ctx,n):X}' for n in range(1,5))
 
         if a in ("connect", "WSAConnect"):
             return self._read_sock_addr(rdx)
         if a == "sendto":
             return self._read_sock_addr(stack_arg(5))
+        if a in ("send", "recv", "WSASend", "WSARecv"):
+            return f"socket:0x{rcx:X} size_or_buffers:{r8}"
         if a == "getaddrinfo":
             return self._read_str(rcx)
         if a in ("InternetOpen", "InternetOpenA"):
             return self._read_str(rcx)
+        if a in ("InternetOpenW", "WinHttpOpen"):
+            return self._read_str(rcx, wide=True)
+        if a in ("InternetConnectW", "InternetConnectA", "WinHttpConnect"):
+            return f"{self._read_str(rdx, wide=a != 'InternetConnectA')}:{r8 & 0xffff}"
+        if a in ("InternetOpenUrlW", "InternetOpenUrlA"):
+            return self._read_str(rdx, wide=a.endswith('W'))
+        if a in ("HttpOpenRequestW", "HttpOpenRequestA", "WinHttpOpenRequest"):
+            wide = a != "HttpOpenRequestA"
+            return f"{self._read_str(rdx, wide)} {self._read_str(r8, wide)}"
+        if a in ("WinHttpSendRequest", "WinHttpReadData"):
+            return f"handle:0x{rcx:X}"
         if a in ("InternetRead", "InternetReadFile"):
             return f"handle:0x{rcx:X}"
 
@@ -595,16 +846,27 @@ class WindowsAPIHooker:
             return self._read_str(rcx, wide=True)
         if a == "CreateFileA":
             return self._read_str(rcx)
+        if a in ("CreateDirectoryW", "CreateDirectoryA", "DeleteFileW", "DeleteFileA"):
+            return self._read_str(rcx, wide=a.endswith('W'))
+        if a == "MoveFileExW":
+            return f"{self._read_str(rcx, True)} -> {self._read_str(rdx, True)}"
         if a == "OpenFile":
             return self._read_str(rcx)
-        if a in ("ZwCreateFile", "NtOpenFile"):
+        if a in ("ZwCreateFile", "NtCreateFile", "NtOpenFile", "NtOpenKey", "NtOpenKeyEx", "NtCreateKey"):
             return oa_name(r8)
+        if a in ("NtReadFile", "NtWriteFile"):
+            return f"handle:0x{rcx:X} bytes:{stack_arg(7)}"
+        if a in ("NtCreateSection", "NtMapViewOfSection"):
+            return f"handle_or_output:0x{rcx:X}"
+        if a == "NtSetValueKey":
+            value = self._read_str(pointer(rdx + pointer_size), True) if rdx else ""
+            return f"handle:0x{rcx:X} value:{value}"
         if a in ("WriteFile", "ReadFile"):
             return f"handle:0x{rcx:X}"
 
         if a in ("LoadLibrary", "LoadLibraryA"):
             return self._read_str(rcx)
-        if a == "LoadLibraryExW":
+        if a in ("LoadLibraryExW", "LoadLibraryW"):
             return self._read_str(rcx, wide=True)
 
         if a in ("CreateProcess", "CreateProcessW"):
@@ -618,36 +880,35 @@ class WindowsAPIHooker:
 
         if a == "ShellExecuteW":
             return f"{self._read_str(rdx, True)} | {self._read_str(r8, True)} | {self._read_str(r9, True)}"
-        if a == "ShellExecute":
+        if a in ("ShellExecute", "ShellExecuteA"):
             return f"{self._read_str(rdx)} | {self._read_str(r8)} | {self._read_str(r9)}"
 
-        if a in ("RegOpenKeyExA", "RegOpenKeyTransactedA"):
+        if a in ("RegOpenKeyExA", "RegOpenKeyTransactedA", "RegCreateKeyExA"):
             return _hkey_name(rcx) + "\\" + self._read_str(rdx)
-        if a in ("RegOpenKeyExW", "RegKeyOpen"):
+        if a in ("RegOpenKeyExW", "RegKeyOpen", "RegCreateKeyExW"):
             return _hkey_name(rcx) + "\\" + self._read_str(rdx, wide=True)
-        if a == "RegQueryValueEx":
+        if a in ("RegQueryValueEx", "RegQueryValueExW"):
             return self._read_str(rdx, wide=True)
         if a == "RegQueryValueExA":
             return self._read_str(rdx)
         if a in ("RegQueryInfoKeyW", "RegQueryInfoKeyA"):
             return _hkey_name(rcx)
-        if a in ("RegSetValue", "RegGetValue"):
-            return _hkey_name(rcx) + "\\" + self._read_str(rdx, wide=True)
+        if a in ("RegSetValue", "RegGetValue", "RegSetValueW", "RegGetValueW", "RegSetValueExW", "RegSetValueExA"):
+            return _hkey_name(rcx) + "\\" + self._read_str(rdx, wide=not a.endswith('A'))
 
-        if a == "CreateService":
+        if a in ("CreateService", "CreateServiceW"):
             return f"{self._read_str(rdx, True)} | {self._read_str(r8, True)}"
-        if a == "StartService":
+        if a in ("StartService", "StartServiceW", "StartServiceA"):
             return f"handle:0x{rcx:X}"
-        if a == "StartServiceA":
-            return self._read_str(rcx)
-
-        if a == "CreateMutex":
+        if a in ("CreateMutex", "CreateMutexW"):
             return self._read_str(r8, wide=True)
 
         if a == "IsDebuggerPresent":
             return ""
         if a == "OutputDebugString":
             return self._read_str(rcx)
+        if a == "OutputDebugStringW":
+            return self._read_str(rcx, wide=True)
 
         if a == "GetAsyncKeyState":
             return f"vkey:{_vk_name(rcx & 0xFF)}"
@@ -659,7 +920,7 @@ class WindowsAPIHooker:
                  "SetWindowsHookExA", "SetWindowsHookExW"):
             return _wh_name(rcx & 0xFFFF)
 
-        return f"rcx=0x{rcx:X}"
+        return f"{'arg1' if self._wow64 else 'rcx'}=0x{rcx:X}"
 
     # ── Hook installation ──────────────────────────────────────────────────────
 
@@ -668,12 +929,35 @@ class WindowsAPIHooker:
         addr = self._resolve_in_local(api_name)
         if not addr:
             return False, "export_not_found"
-        if not self._install_bp(addr, api_name):
+        if not self._install_bp(addr, self._resolved_exports.get(api_name, api_name)):
             return False, f"write_failed (err={ctypes.get_last_error()})"
+        self._api_addresses[api_name] = addr
         return True, ""
+
+    def _forget_module(self, base):
+        """Retire unmapped patches; a later DLL at this address must start fresh."""
+        ranges = [info for info in self._target_modules.values() if info[0] == base]
+        addresses = {addr for addr in self._bp
+                     if any(start <= addr < start + size for start, size in ranges)}
+        for addr in addresses:
+            # UNLOAD_DLL arrives after unmapping: restoring an old byte could
+            # overwrite unrelated memory after address reuse.
+            del self._bp[addr]
+        for api, addr in list(self._api_addresses.items()):
+            if addr in addresses:
+                del self._api_addresses[api]
+                if api in self.hooked:
+                    self.hooked.remove(api)
+                self._deferred.add(api)
+        self._target_modules = {path: info for path, info in self._target_modules.items()
+                                if info[0] != base}
+        self._remote_export_cache = {key: value for key, value in self._remote_export_cache.items()
+                                     if key[0] != base}
 
     def _install_pending(self):
         """Try to install hooks for all APIs in `_deferred`."""
+        self._target_modules = {name.casefold(): (base, size) for name, base, size in
+                                _process_modules(self.pid, self._wow64)}
         for api in list(self._deferred):
             ok, reason = self._try_hook(api)
             if ok:
@@ -707,17 +991,21 @@ class WindowsAPIHooker:
                 return
 
             kernel32.DebugSetProcessKillOnExit(False)
+            self.phase = "initial_events"
             self._debug_loop_inner()
 
         except Exception as exc:
             self.loop_error = f"{type(exc).__name__}: {exc}"
         finally:
+            for address in self._bp:
+                self._restore_bp(address)
             self._running = False
             self._finalize_failed()
             try:
                 kernel32.DebugActiveProcessStop(self.pid)
             except Exception:
                 pass
+            self.phase = "failed" if self.attach_error or self.loop_error else "stopped"
 
     def _debug_loop_inner(self):
         de       = DEBUG_EVENT()
@@ -730,24 +1018,31 @@ class WindowsAPIHooker:
                 if err not in (0, 121):   # 121 = WAIT_TIMEOUT
                     self.loop_error = f"WaitForDebugEvent error {err}"
                     return
+                if self._stop_requested.is_set() and not self._break_requested and not self._pending_ss:
+                    self._break_requested = bool(kernel32.DebugBreakProcess(self._ph))
+                    if not self._break_requested:
+                        self.loop_error = f"DebugBreakProcess failed (error {ctypes.get_last_error()})"
                 continue
 
             cont = DBG_CONTINUE
             evt  = de.dwDebugEventCode
             tid  = de.dwThreadId
             pid  = de.dwProcessId
+            self.debug_event_count += 1
 
             if evt == EXCEPTION_DEBUG_EVENT:
                 exc  = de.u.Exception.ExceptionRecord
                 code = exc.ExceptionCode & 0xFFFFFFFF
                 addr = exc.ExceptionAddress or 0
 
-                if code == EXCEPTION_BREAKPOINT:
+                if code in (EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT):
                     if first_bp:
                         # Synthetic attach break-in from ntdll!DbgBreakPoint
                         first_bp = False
+                        self.phase = "installing"
                         self._install_pending()
                         self.ready = True
+                        self.phase = "tracing"
                     else:
                         bp_addr = addr   # ExceptionAddress IS the INT3 address
                         if bp_addr in self._bp:
@@ -758,7 +1053,16 @@ class WindowsAPIHooker:
                                 if ctx:
                                     api_name = self._bp[bp_addr]["api"]
                                     args_str = self._extract_args(api_name, ctx)
+                                    if self.event_callback and api_name in INJECTION_APIS:
+                                        try:
+                                            event = capture_api_event(self,api_name,ctx,tid)
+                                            if event:
+                                                self.event_callback(event)
+                                        except Exception as exc:
+                                            if len(self.event_errors)<16:
+                                                self.event_errors.append(f'{api_name}: {type(exc).__name__}: {exc}')
                                     try:
+                                        self.api_call_count += 1
                                         self.callback(api_name, args_str)
                                     except Exception:
                                         pass
@@ -768,9 +1072,12 @@ class WindowsAPIHooker:
                                     self._pending_ss[tid] = bp_addr
                                 kernel32.CloseHandle(th)
                         else:
-                            cont = DBG_EXCEPTION_NOT_HANDLED
+                            if self._break_requested:
+                                self._break_requested = False
+                            else:
+                                cont = DBG_EXCEPTION_NOT_HANDLED
 
-                elif code == EXCEPTION_SINGLE_STEP:
+                elif code in (EXCEPTION_SINGLE_STEP, STATUS_WX86_SINGLE_STEP):
                     bp_addr = self._pending_ss.pop(tid, None)
                     if bp_addr is not None:
                         self._reinstall_bp(bp_addr)
@@ -782,9 +1089,13 @@ class WindowsAPIHooker:
                                 self._set_context(th)
                             kernel32.CloseHandle(th)
                     else:
-                        cont = DBG_CONTINUE   # not our single-step; pass it through
+                        cont = DBG_EXCEPTION_NOT_HANDLED
 
                 else:
+                    if len(self.exceptions) < 1000:
+                        self.exceptions.append({"code": f"0x{code:08X}", "address": f"0x{addr:X}",
+                                                "thread_id": tid, "first_chance": bool(de.u.Exception.dwFirstChance),
+                                                "time": time.time()})
                     cont = DBG_EXCEPTION_NOT_HANDLED
 
             elif evt == LOAD_DLL_DEBUG_EVENT:
@@ -792,24 +1103,41 @@ class WindowsAPIHooker:
                 if info.hFile:
                     kernel32.CloseHandle(info.hFile)
                 # Retry any APIs not yet hooked (DLL might just have been loaded)
-                if self._deferred:
+                if self.ready and self._deferred:
                     self._install_pending()
 
             elif evt == CREATE_PROCESS_DEBUG_EVENT:
                 ci = de.u.CreateProcessInfo
                 if ci.hFile:    kernel32.CloseHandle(ci.hFile)
-                if ci.hProcess: kernel32.CloseHandle(ci.hProcess)
-                if ci.hThread:  kernel32.CloseHandle(ci.hThread)
+                # Windows owns the event's process/thread handles and closes
+                # them on EXIT/ContinueDebugEvent (or debugger detach). Closing
+                # them here lets a reused Python semaphore handle be closed a
+                # second time later, corrupting the analyzer itself.
 
-            elif evt == CREATE_THREAD_DEBUG_EVENT:
-                if de.u.CreateThread.hThread:
-                    kernel32.CloseHandle(de.u.CreateThread.hThread)
+            elif evt == UNLOAD_DLL_DEBUG_EVENT:
+                self._forget_module(de.u.UnloadDll.lpBaseOfDll)
+
+            elif evt == EXIT_THREAD_DEBUG_EVENT:
+                bp_addr = self._pending_ss.pop(tid, None)
+                if bp_addr is not None:
+                    self._reinstall_bp(bp_addr)
 
             elif evt == EXIT_PROCESS_DEBUG_EVENT:
+                self.exit_code = de.u.ExitProcess.dwExitCode
                 kernel32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 self._running = False
                 return
 
+            # Finish all outstanding single steps before detaching. Clearing
+            # EFlags at an unrelated break-in does not consume an already
+            # queued WOW64 single-step exception and can terminate the target.
+            # Every debug event suspends the process, so a normal event is also
+            # a safe opportunity to remove patches without another break-in.
+            if self._stop_requested.is_set() and not self._pending_ss and not self._break_requested:
+                for address in self._bp:
+                    self._restore_bp(address)
+                kernel32.ContinueDebugEvent(pid, tid, cont)
+                return
             kernel32.ContinueDebugEvent(pid, tid, cont)
 
     # ── Public interface ───────────────────────────────────────────────────────
@@ -822,13 +1150,34 @@ class WindowsAPIHooker:
         """
         _enable_sedebug()   # best-effort; proceeds even if privilege elevation fails
 
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise OSError("API tracing requires 64-bit Python")
+
         self._ph = kernel32.OpenProcess(
-            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | 0x0400 | 0x0002,
             False, self.pid,
         )
         if not self._ph:
             err = ctypes.get_last_error()
             raise OSError(f"OpenProcess({self.pid}) failed (error {err})")
+
+        if self.expected_birth is not None:
+            times = [ctypes.c_uint64() for _ in range(4)]
+            if (not kernel32.GetProcessTimes(self._ph, *(ctypes.byref(t) for t in times))
+                    or filetime_to_unix(times[0].value) != self.expected_birth):
+                kernel32.CloseHandle(self._ph)
+                self._ph = None
+                raise OSError('Process identity changed or creation time is inaccessible')
+
+        wow64 = W.BOOL()
+        if not kernel32.IsWow64Process(self._ph, ctypes.byref(wow64)):
+            kernel32.CloseHandle(self._ph)
+            self._ph = None
+            raise OSError("Could not determine target architecture")
+        self._wow64 = bool(wow64.value)
+        self.architecture = 'x86' if self._wow64 else 'x64'
+        if not self._wow64:
+            self._prepare_exports()
 
         # VirtualAlloc guarantees >= 4096-byte alignment, satisfying CONTEXT's
         # requirement that FltSave (XMM_SAVE_AREA32) lands on a 16-byte boundary.
@@ -838,6 +1187,7 @@ class WindowsAPIHooker:
         )
         if not self._ctx_buf:
             kernel32.CloseHandle(self._ph)
+            self._ph = None
             raise OSError("VirtualAlloc for CONTEXT failed")
 
         self._running = True
@@ -847,12 +1197,20 @@ class WindowsAPIHooker:
 
     def stop(self):
         """Signal the debug loop to stop and release resources."""
-        self._running = False
+        self._stop_requested.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                # The worker still owns these resources. A timed-out join is
+                # not proof of termination; callers can retry stop().
+                return False
         if self._ctx_buf:
             kernel32.VirtualFree(ctypes.c_void_p(self._ctx_buf), 0, MEM_RELEASE)
             self._ctx_buf = None
         if self._ph:
             kernel32.CloseHandle(self._ph)
             self._ph = None
+        if self._dup_ph:
+            kernel32.CloseHandle(self._dup_ph)
+            self._dup_ph = None
+        return True

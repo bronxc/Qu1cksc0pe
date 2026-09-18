@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "context_rule_files": {
+    "Systems/Windows/YaraRules_Windows/crypto_signatures.yara": "Generic hex strings and cryptographic constants; not evidence of malware.",
+    "Systems/Windows/YaraRules_Windows/antidebug_antivm.yara": "VM, debugger and API capability strings; their presence does not prove anti-analysis behavior or API execution.",
+    "Systems/Windows/YaraRules_Windows/capabilities.yara": "API and capability strings; their presence does not establish execution, intent or malware."
+  },
+  "context_rules": {
+    "Systems/Windows/YaraRules_Windows/RAT_Ratdecoders.yara": {
+      "UPX": "UPX packing markers occur in benign and malicious executables; they do not establish a RAT or malware family."
+    }
+  }
+}

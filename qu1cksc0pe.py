@@ -102,7 +102,7 @@ else:
         _ph.write(sc0pe_path)
 
 # Utility functions
-from Modules.utils.helpers import err_exit
+from Modules.utils.helpers import err_exit, run_interactive_monitor
 
 MODULE_PREFIX = f"{sc0pe_path}{path_seperator}Modules{path_seperator}"
 def execute_module(module, *module_args, path=MODULE_PREFIX, invoker=None, env=None):
@@ -126,6 +126,8 @@ def execute_module(module, *module_args, path=MODULE_PREFIX, invoker=None, env=N
         warnings.warn("Direct execution of Python files won't be supported much longer." + f" {DEV_NOTE}", PendingDeprecationWarning)
     module_path = os.path.join(path, str(module))
     command = [*invoker_args, module_path, *(str(arg) for arg in module_args)]
+    if module == 'emulator.py':
+        return run_interactive_monitor(command, env=env)
     return subprocess.run(command, check=False, env=env)
 
 # Only the *stdio* MCP transport talks JSON-RPC over this process's own
@@ -170,7 +172,7 @@ ARG_NAMES_TO_KWARG_OPTS = {
     "report": {"help": "Export analysis reports into a file (JSON Format for now).", "action": "store_true"},
     "ai": {"help": "Analyze generated report using smart analyzer (requires --report; enabled automatically).", "action": "store_true"},
     "ai_provider": {"help": "AI backend for --ai: auto (Ollama, default, local/private), ollama, claude, openai, deepseek, kimi, or glm.", "choices": ["auto", "ollama", "claude", "openai", "deepseek", "kimi", "glm"], "default": None},
-    "watch": {"help": "Perform dynamic analysis against Windows/Android files. (Linux will coming soon!!)", "action": "store_true"},
+    "watch": {"help": "Perform Windows, Linux or Android dynamic analysis.", "action": "store_true"},
     "sigcheck": {"help": "Scan file signatures in target file.", "action": "store_true"},
     "vtFile": {"help": "Scan your file with VirusTotal API.", "action": "store_true"},
     "ui": {"help": "Launch Flask-based web interface.", "action": "store_true"},
@@ -448,11 +450,6 @@ def BasicAnalyzer(analyzeFile):
             else:
                 execute_module("apkAnalyzer.py", analyzeFile, "False", "APK")
             _maybe_run_ai()
-            if not args.report:
-                # APP Security
-                choice = str(input(f"\n{infoC} Do you want to check target app\'s security? This process will take a while.[Y/n]: "))
-                if choice == "Y" or choice == "y":
-                    execute_module("apkSecCheck.py")
 
     # Pcap analysis
     elif "pcap" in fileType or "capture file" in fileType or lower_ext in (".pcap", ".pcapng"):
@@ -746,7 +743,7 @@ def _prepare_strings_file():
 
 
 def cleanup_junks():
-    junkFiles = [".target-file.txt", ".target-folder.txt", "TargetAPK/", "TargetSource/"]
+    junkFiles = [".target-file.txt", ".target-folder.txt"]
     for junk in junkFiles:
         if os.path.exists(junk):
             try: # assume simple file
